@@ -1,40 +1,14 @@
 //! # spider-core
 //!
-//! The core engine of the `spider-lib` web scraping framework.
+//! Core engine of the `spider-lib` web scraping framework.
 //!
-//! This crate provides the fundamental components for building web scrapers,
-//! including the main `Crawler`, `Scheduler`, `Spider` trait, and other
-//! essential infrastructure for managing the crawling process.
+//! Provides the main components: `Crawler`, `Scheduler`, `Spider` trait, and infrastructure.
 //!
-//! ## Overview
-//!
-//! The `spider-core` crate implements the central orchestration layer of the
-//! web scraping framework. It manages the flow of requests and responses,
-//! coordinates concurrent operations, and provides the foundation for
-//! middleware and pipeline systems.
-//!
-//! ## Key Components
-//!
-//! - **Crawler**: The main orchestrator that manages the crawling process
-//! - **Scheduler**: Handles request queuing and duplicate detection
-//! - **Spider**: Trait defining the interface for custom scraping logic
-//! - **CrawlerBuilder**: Fluent API for configuring and building crawlers
-//! - **Middleware**: Interceptors for processing requests and responses
-//! - **Pipeline**: Processors for scraped items
-//! - **Stats**: Collection and reporting of crawl statistics
-//!
-//! ## Usage
-//!
-//! Most users will interact with the components re-exported from this crate
-//! through the main `spider-lib` facade. However, this crate can be used
-//! independently for fine-grained control over the crawling process.
+//! ## Example
 //!
 //! ```rust,ignore
-//! use spider_core::{Crawler, CrawlerBuilder, Spider, Scheduler};
-//! use spider_util::{request::Request, response::Response, error::SpiderError};
-//!
-//! #[derive(Default)]
-//! struct MySpider;
+//! use spider_core::{Crawler, CrawlerBuilder, Spider};
+//! use spider_util::{response::Response, error::SpiderError, item::ParseOutput};
 //!
 //! #[spider_macro::scraped_item]
 //! struct MyItem {
@@ -42,16 +16,13 @@
 //!     url: String,
 //! }
 //!
+//! struct MySpider;
+//!
 //! #[async_trait::async_trait]
 //! impl Spider for MySpider {
 //!     type Item = MyItem;
-//!
-//!     fn start_urls(&self) -> Vec<&'static str> {
-//!         vec!["https://example.com"]
-//!     }
-//!
+//!     fn start_urls(&self) -> Vec<&'static str> { vec!["https://example.com"] }
 //!     async fn parse(&mut self, response: Response) -> Result<ParseOutput<Self::Item>, SpiderError> {
-//!         // Custom parsing logic here
 //!         todo!()
 //!     }
 //! }
