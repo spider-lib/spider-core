@@ -216,7 +216,7 @@ where
                 let path_clone = path.clone();
                 
                 #[cfg(feature = "cookie-store")]
-                let cookie_store_clone = cookie_store.clone();
+                let cookie_store_clone = self.cookie_store.clone();
                 
                 #[cfg(not(feature = "cookie-store"))]
                 let _cookie_store_clone = ();
