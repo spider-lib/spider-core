@@ -335,7 +335,7 @@ where
                 let scheduler_checkpoint = scheduler.snapshot().await?;
                 
                 #[cfg(feature = "cookie-store")]
-                let result = save_checkpoint::<S>(path, scheduler_checkpoint, &pipelines, &cookie_store).await;
+                let result = save_checkpoint::<S>(path, scheduler_checkpoint, &pipelines, &self.cookie_store).await;
                 
                 #[cfg(not(feature = "cookie-store"))]
                 let result = save_checkpoint::<S>(path, scheduler_checkpoint, &pipelines, &()).await;
