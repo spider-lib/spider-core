@@ -187,14 +187,14 @@ impl<S: Spider, D: Downloader> CrawlerBuilder<S, D> {
     where
         D: Downloader + Send + Sync + 'static,
         D::Client: Send + Sync + Clone,
+        S::Item: Send + Sync + 'static,
     {
         let spider = self.validate_and_get_spider()?;
-        
-        // Ensure there's at least one pipeline
+
+        // Add a default ConsoleWriter pipeline if none are provided
         if self.item_pipelines.is_empty() {
-            return Err(SpiderError::ConfigurationError(
-                "At least one pipeline must be added to the crawler.".to_string(),
-            ));
+            use spider_pipeline::console_writer::ConsoleWriterPipeline;
+            self.item_pipelines.push(Box::new(ConsoleWriterPipeline::new()));
         }
 
         let (initial_scheduler_state, loaded_cookie_store) =
