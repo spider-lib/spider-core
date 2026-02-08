@@ -63,6 +63,7 @@
 //! ```
 
 pub mod builder;
+#[cfg(feature = "checkpoint")]
 pub mod checkpoint;
 pub mod crawler;
 pub mod prelude;
@@ -71,11 +72,14 @@ pub mod spider;
 pub mod state;
 pub mod stats;
 
-// Re-export SchedulerCheckpoint and Checkpoint
+// Re-export SchedulerCheckpoint and Checkpoint (when checkpoint feature is enabled)
+#[cfg(feature = "checkpoint")]
 pub use checkpoint::{Checkpoint, SchedulerCheckpoint};
+
 pub use spider_downloader::{Downloader, ReqwestClientDownloader, SimpleHttpClient};
 
-// Re-export CookieStore
+// Re-export CookieStore (when cookie-store feature is enabled)
+#[cfg(feature = "cookie-store")]
 pub use cookie_store::CookieStore;
 
 pub use builder::CrawlerBuilder;

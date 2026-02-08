@@ -76,6 +76,29 @@ This crate depends on:
 - `spider-pipeline`: For item processing
 - Various external crates for async processing, serialization, and data structures
 
+## Features
+
+This crate uses feature flags to allow selective inclusion of optional functionality:
+
+- `core` (default): Includes core functionality
+- `checkpoint`: Enables checkpoint and resume functionality (requires `rmp-serde`, `time`)
+- `cookie-store`: Enables advanced cookie store integration (requires `cookie_store`)
+
+### Important Feature Relationships
+- `cookie-store` and `middleware-cookies` (from spider-middleware) are interdependent: When using `cookie-store`, `middleware-cookies` functionality may be desired for managing cookies effectively. When using `middleware-cookies`, `cookie-store` should be enabled for full functionality.
+
+To use only core functionality:
+```toml
+[dependencies]
+spider-core = { version = "...", default-features = false, features = ["core"] }
+```
+
+To include specific features:
+```toml
+[dependencies]
+spider-core = { version = "...", features = ["checkpoint", "cookie-store"] }
+```
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](./LICENSE) file for details.

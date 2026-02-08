@@ -41,6 +41,7 @@
 //! scheduler.send_mark_as_visited("unique_fingerprint".to_string()).await?;
 //! ```
 
+#[cfg(feature = "checkpoint")]
 use crate::SchedulerCheckpoint;
 
 use spider_util::error::SpiderError;
@@ -73,6 +74,7 @@ pub struct Scheduler {
 
 impl Scheduler {
     /// Creates a new `Scheduler` and returns a tuple containing the scheduler and a request receiver.
+    #[cfg(feature = "checkpoint")]
     pub fn new(
         initial_state: Option<SchedulerCheckpoint>,
     ) -> (Arc<Self>, AsyncReceiver<Request>) {
@@ -114,6 +116,39 @@ impl Scheduler {
             pending_requests = AtomicUsize::new(0);
             salvaged_requests = SegQueue::new();
         }
+
+        let scheduler = Arc::new(Scheduler {
+            request_queue,
+            visited_urls,
+            bloom_filter: std::sync::Arc::new(parking_lot::RwLock::new(BloomFilter::new(1000000, 3))),
+            tx_internal,
+            pending_requests,
+            salvaged_requests,
+            is_shutting_down: AtomicBool::new(false),
+            max_pending_requests: 10000,
+        });
+
+        let scheduler_clone = Arc::clone(&scheduler);
+        tokio::spawn(async move {
+            scheduler_clone.run_loop(rx_internal, tx_req_out).await;
+        });
+
+        (scheduler, rx_req_out)
+    }
+
+    /// Creates a new `Scheduler` without checkpoint support and returns a tuple containing the scheduler and a request receiver.
+    #[cfg(not(feature = "checkpoint"))]
+    pub fn new(
+        _initial_state: Option<()>, // Placeholder parameter to maintain same signature
+    ) -> (Arc<Self>, AsyncReceiver<Request>) {
+        let (tx_internal, rx_internal) = unbounded_async();
+
+        let (tx_req_out, rx_req_out) = bounded_async(100);
+
+        let request_queue = SegQueue::new();
+        let visited_urls = Cache::builder().max_capacity(100000).build();
+        let pending_requests = AtomicUsize::new(0);
+        let salvaged_requests = SegQueue::new();
 
         let scheduler = Arc::new(Scheduler {
             request_queue,
@@ -221,6 +256,7 @@ impl Scheduler {
 
     /// Takes a snapshot of the current state of the scheduler.
     /// Uses a non-blocking approach to collect queue elements without disrupting concurrent operations.
+    #[cfg(feature = "checkpoint")]
     pub async fn snapshot(&self) -> Result<SchedulerCheckpoint, SpiderError> {
         let visited_urls = dashmap::DashSet::new();
         for entry in self.visited_urls.iter() {
@@ -268,6 +304,13 @@ impl Scheduler {
             visited_urls,
             salvaged_requests,
         })
+    }
+
+    /// Takes a snapshot of the current state of the scheduler (stub when checkpoint feature is disabled).
+    #[cfg(not(feature = "checkpoint"))]
+    pub async fn snapshot(&self) -> Result<(), SpiderError> {
+        // Return an empty result when checkpoint feature is disabled
+        Ok(())
     }
 
     /// Enqueues a new request to be processed.

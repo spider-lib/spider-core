@@ -14,7 +14,7 @@
 //! - **Concurrency Configuration**: Control the number of concurrent downloads,
 //!   parsing workers, and pipeline processors
 //! - **Component Registration**: Attach custom downloaders, middlewares, and pipelines
-//! - **Checkpoint Management**: Configure automatic saving and loading of crawl state
+//! - **Checkpoint Management**: Configure automatic saving and loading of crawl state (feature: `core-checkpoint`)
 //! - **Statistics Integration**: Initialize and connect the `StatCollector`
 //! - **Default Handling**: Automatic addition of essential middlewares when needed
 //!
@@ -39,7 +39,6 @@
 //! }
 //! ```
 
-use crate::SchedulerCheckpoint;
 use spider_util::error::SpiderError;
 use spider_middleware::middleware::Middleware;
 use spider_pipeline::pipeline::Pipeline;
@@ -48,15 +47,22 @@ use crate::spider::Spider;
 use crate::Downloader;
 use crate::ReqwestClientDownloader;
 use num_cpus;
-use std::fs;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, warn};
 
 use super::Crawler;
 use crate::stats::StatCollector;
+#[cfg(feature = "checkpoint")]
+use tracing::{debug, warn};
+
+#[cfg(feature = "checkpoint")]
+use crate::SchedulerCheckpoint;
+#[cfg(feature = "checkpoint")]
+use std::fs;
+#[cfg(feature = "checkpoint")]
+use rmp_serde;
 
 /// Configuration for the crawler's concurrency settings.
 pub struct CrawlerConfig {
@@ -197,34 +203,106 @@ impl<S: Spider, D: Downloader> CrawlerBuilder<S, D> {
             self.item_pipelines.push(Box::new(ConsoleWriterPipeline::new()));
         }
 
-        let (initial_scheduler_state, loaded_cookie_store) =
-            self.load_and_restore_checkpoint_state().await?;
+        #[cfg(all(feature = "checkpoint", feature = "cookie-store"))]
+        {
+            let (initial_scheduler_state, loaded_cookie_store) =
+                self.load_and_restore_checkpoint_state().await?;
+            let (scheduler_arc, req_rx) = Scheduler::new(initial_scheduler_state);
+            let downloader_arc = Arc::new(self.downloader);
+            let stats = Arc::new(StatCollector::new());
+            let crawler = Crawler::new(
+                scheduler_arc,
+                req_rx,
+                downloader_arc,
+                self.middlewares,
+                spider,
+                self.item_pipelines,
+                self.crawler_config.max_concurrent_downloads,
+                self.crawler_config.parser_workers,
+                self.crawler_config.max_concurrent_pipelines,
+                self.crawler_config.channel_capacity,
+                self.checkpoint_path.take(),
+                self.checkpoint_interval,
+                stats,
+                Arc::new(tokio::sync::RwLock::new(loaded_cookie_store.unwrap_or_default())),
+            );
+            return Ok(crawler);
+        }
 
-        let (scheduler_arc, req_rx) = Scheduler::new(initial_scheduler_state);
+        #[cfg(all(feature = "checkpoint", not(feature = "cookie-store")))]
+        {
+            let (initial_scheduler_state, _loaded_cookie_store) =
+                self.load_and_restore_checkpoint_state().await?;
+            let (scheduler_arc, req_rx) = Scheduler::new(initial_scheduler_state);
+            let downloader_arc = Arc::new(self.downloader);
+            let stats = Arc::new(StatCollector::new());
+            let crawler = Crawler::new(
+                scheduler_arc,
+                req_rx,
+                downloader_arc,
+                self.middlewares,
+                spider,
+                self.item_pipelines,
+                self.crawler_config.max_concurrent_downloads,
+                self.crawler_config.parser_workers,
+                self.crawler_config.max_concurrent_pipelines,
+                self.crawler_config.channel_capacity,
+                self.checkpoint_path.take(),
+                self.checkpoint_interval,
+                stats,
+            );
+            return Ok(crawler);
+        }
 
-        let downloader_arc = Arc::new(self.downloader);
-        let stats = Arc::new(StatCollector::new());
+        #[cfg(all(not(feature = "checkpoint"), feature = "cookie-store"))]
+        {
+            let (_initial_scheduler_state, loaded_cookie_store) =
+                self.load_and_restore_checkpoint_state().await?;
+            let (scheduler_arc, req_rx) = Scheduler::new(None::<()>);
+            let downloader_arc = Arc::new(self.downloader);
+            let stats = Arc::new(StatCollector::new());
+            let crawler = Crawler::new(
+                scheduler_arc,
+                req_rx,
+                downloader_arc,
+                self.middlewares,
+                spider,
+                self.item_pipelines,
+                self.crawler_config.max_concurrent_downloads,
+                self.crawler_config.parser_workers,
+                self.crawler_config.max_concurrent_pipelines,
+                self.crawler_config.channel_capacity,
+                stats,
+                Arc::new(tokio::sync::RwLock::new(loaded_cookie_store.unwrap_or_default())),
+            );
+            return Ok(crawler);
+        }
 
-        let crawler = Crawler::new(
-            scheduler_arc,
-            req_rx,
-            downloader_arc,
-            self.middlewares,
-            spider,
-            self.item_pipelines,
-            self.crawler_config.max_concurrent_downloads,
-            self.crawler_config.parser_workers,
-            self.crawler_config.max_concurrent_pipelines,
-            self.crawler_config.channel_capacity,
-            self.checkpoint_path.take(),
-            self.checkpoint_interval,
-            stats,
-            Arc::new(tokio::sync::RwLock::new(loaded_cookie_store.unwrap_or_default())),
-        );
-
-        Ok(crawler)
+        #[cfg(all(not(feature = "checkpoint"), not(feature = "cookie-store")))]
+        {
+            let (_initial_scheduler_state, _loaded_cookie_store) =
+                self.load_and_restore_checkpoint_state().await?;
+            let (scheduler_arc, req_rx) = Scheduler::new(None::<()>);
+            let downloader_arc = Arc::new(self.downloader);
+            let stats = Arc::new(StatCollector::new());
+            let crawler = Crawler::new(
+                scheduler_arc,
+                req_rx,
+                downloader_arc,
+                self.middlewares,
+                spider,
+                self.item_pipelines,
+                self.crawler_config.max_concurrent_downloads,
+                self.crawler_config.parser_workers,
+                self.crawler_config.max_concurrent_pipelines,
+                self.crawler_config.channel_capacity,
+                stats,
+            );
+            return Ok(crawler);
+        }
     }
 
+    #[cfg(all(feature = "checkpoint", feature = "cookie-store"))]
     async fn load_and_restore_checkpoint_state(
         &mut self,
     ) -> Result<(Option<SchedulerCheckpoint>, Option<crate::CookieStore>), SpiderError> {
@@ -239,7 +317,7 @@ impl<S: Spider, D: Downloader> CrawlerBuilder<S, D> {
                     Ok(checkpoint) => {
                         initial_scheduler_state = Some(checkpoint.scheduler);
                         loaded_pipelines_state = Some(checkpoint.pipelines);
-                        
+
                         loaded_cookie_store = Some(checkpoint.cookie_store);
                     }
                     Err(e) => warn!("Failed to deserialize checkpoint from {:?}: {}", path, e),
@@ -259,6 +337,56 @@ impl<S: Spider, D: Downloader> CrawlerBuilder<S, D> {
         }
 
         Ok((initial_scheduler_state, loaded_cookie_store))
+    }
+
+    #[cfg(all(feature = "checkpoint", not(feature = "cookie-store")))]
+    async fn load_and_restore_checkpoint_state(
+        &mut self,
+    ) -> Result<(Option<SchedulerCheckpoint>, Option<()>), SpiderError> {
+        let mut initial_scheduler_state = None;
+        let mut loaded_pipelines_state = None;
+
+        if let Some(path) = &self.checkpoint_path {
+            debug!("Attempting to load checkpoint from {:?}", path);
+            match fs::read(path) {
+                Ok(bytes) => match rmp_serde::from_slice::<crate::Checkpoint>(&bytes) {
+                    Ok(checkpoint) => {
+                        initial_scheduler_state = Some(checkpoint.scheduler);
+                        loaded_pipelines_state = Some(checkpoint.pipelines);
+                    }
+                    Err(e) => warn!("Failed to deserialize checkpoint from {:?}: {}", path, e),
+                },
+                Err(e) => warn!("Failed to read checkpoint file {:?}: {}", path, e),
+            }
+        }
+
+        if let Some(pipeline_states) = loaded_pipelines_state {
+            for (name, state) in pipeline_states {
+                if let Some(pipeline) = self.item_pipelines.iter().find(|p| p.name() == name) {
+                    pipeline.restore_state(state).await?;
+                } else {
+                    warn!("Checkpoint contains state for unknown pipeline: {}", name);
+                }
+            }
+        }
+
+        Ok((initial_scheduler_state, None))
+    }
+
+    #[cfg(all(not(feature = "checkpoint"), not(feature = "cookie-store")))]
+    async fn load_and_restore_checkpoint_state(
+        &mut self,
+    ) -> Result<(Option<()>, Option<()>), SpiderError> {
+        // When both checkpoint and cookie-store features are disabled, return None for both values
+        Ok((None, None))
+    }
+
+    #[cfg(all(not(feature = "checkpoint"), feature = "cookie-store"))]
+    async fn load_and_restore_checkpoint_state(
+        &mut self,
+    ) -> Result<(Option<()>, Option<crate::CookieStore>), SpiderError> {
+        // When checkpoint is disabled but cookie-store is enabled, initialize default cookie store
+        Ok((None, Some(crate::CookieStore::default())))
     }
 
     fn validate_and_get_spider(&mut self) -> Result<S, SpiderError> {

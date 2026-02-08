@@ -20,7 +20,11 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+#[cfg(feature = "cookie-store")]
 use tokio::sync::RwLock;
+
+#[cfg(feature = "cookie-store")]
+use cookie_store::CookieStore;
 
 /// A snapshot of the scheduler's state.
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -41,15 +45,22 @@ pub struct Checkpoint {
     /// A map of pipeline states, keyed by pipeline name.
     pub pipelines: HashMap<String, Value>,
     /// The state of the cookie store.
+    #[cfg(feature = "cookie-store")]
     #[serde(default)]
-    pub cookie_store: cookie_store::CookieStore,
+    pub cookie_store: CookieStore,
+    
+    /// Placeholder when cookie store is disabled
+    #[cfg(not(feature = "cookie-store"))]
+    #[serde(skip)]
+    pub _cookie_store_placeholder: (),
 }
 
 pub async fn save_checkpoint<S: Spider>(
     path: &Path,
     scheduler_checkpoint: SchedulerCheckpoint,
     pipelines: &Arc<Vec<Box<dyn Pipeline<S::Item>>>>,
-    cookie_store: &Arc<RwLock<cookie_store::CookieStore>>,
+    #[cfg(feature = "cookie-store")] cookie_store: &Arc<RwLock<CookieStore>>,
+    #[cfg(not(feature = "cookie-store"))] _cookie_store: &(),
 ) -> Result<(), SpiderError>
 where
     S::Item: ScrapedItem,
@@ -70,15 +81,16 @@ where
         );
     }
 
-    let checkpoint = {
-        let cookie_store_read = cookie_store.read().await;
-        let cookie_store_clone = (*cookie_store_read).clone();
-        drop(cookie_store_read);
-        Checkpoint {
-            scheduler: scheduler_checkpoint,
-            pipelines: pipelines_checkpoint_map,
-            cookie_store: cookie_store_clone,
-        }
+    let checkpoint = Checkpoint {
+        scheduler: scheduler_checkpoint,
+        pipelines: pipelines_checkpoint_map,
+        #[cfg(feature = "cookie-store")]
+        cookie_store: {
+            let cookie_store_read = cookie_store.read().await;
+            (*cookie_store_read).clone()
+        },
+        #[cfg(not(feature = "cookie-store"))]
+        _cookie_store_placeholder: (),
     };
 
     let tmp_path = path.with_extension("tmp");
