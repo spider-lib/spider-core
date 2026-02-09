@@ -241,9 +241,20 @@ where
             let request_url = request_for_download.url.clone();
             trace!("Downloading request for URL: {}", request_url);
             stats.increment_requests_sent();
+
+            // Measure request time
+            let start_time = std::time::Instant::now();
             match downloader.download(request_for_download).await {
                 Ok(resp) => {
-                    trace!("Download successful for URL: {}", resp.url);
+                    let duration = start_time.elapsed();
+                    trace!(
+                        "Download successful for URL: {}, took {:?}",
+                        resp.url, duration
+                    );
+
+                    // Record the request time
+                    stats.record_request_time(&resp.url.to_string(), duration);
+
                     stats.increment_requests_succeeded();
                     stats.increment_responses_received();
                     stats.record_response_status(resp.status.as_u16());
@@ -251,6 +262,15 @@ where
                     resp
                 }
                 Err(e) => {
+                    let duration = start_time.elapsed();
+                    trace!(
+                        "Download failed for URL: {}, took {:?}",
+                        request_url, duration
+                    );
+
+                    // Still record the time even for failed requests
+                    stats.record_request_time(&request_url.to_string(), duration);
+
                     error!("Download error for URL {}: {:?}", request_url, e);
                     stats.increment_requests_failed();
                     state.in_flight_requests.fetch_sub(1, Ordering::SeqCst);
