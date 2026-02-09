@@ -3,8 +3,8 @@
 //! This module provides a `MiddlewareManager` that stores middlewares in a vector
 //! and allows efficient concurrent access without requiring a mutex for every operation.
 
-use spider_util::error::SpiderError;
 use spider_middleware::middleware::{Middleware, MiddlewareAction};
+use spider_util::error::SpiderError;
 use spider_util::request::Request;
 use spider_util::response::Response;
 use std::sync::Arc;
@@ -106,4 +106,3 @@ impl<C: Send + Sync + Clone + 'static> Clone for SharedMiddlewareManager<C> {
         }
     }
 }
-

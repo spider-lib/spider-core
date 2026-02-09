@@ -1,13 +1,30 @@
+//! Contains the request handling logic for the spider crawler.
+//!
+//! This module implements the core request processing pipeline that manages the flow of requests
+//! and responses through the crawling system. It handles:
+//!
+//! - Receiving requests from the scheduler
+//! - Managing concurrent downloads with configurable limits
+//! - Processing requests through middleware chains
+//! - Applying backpressure mechanisms to prevent overload
+//! - Handling response transmission back to the processing pipeline
+//! - Coordinating with the scheduler for shutdown procedures
+//!
+//! The main entry point is the `spawn_downloader_task` function which creates an async task
+//! responsible for continuously processing requests from a receiver channel, downloading them,
+//! and sending responses to a transmitter channel.
+
+use crate::Downloader;
 use crate::crawler::SharedMiddlewareManager;
-use spider_util::item::ScrapedItem;
-use spider_middleware::middleware::MiddlewareAction;
-use spider_util::request::Request;
-use spider_util::response::Response;
 use crate::scheduler::Scheduler;
 use crate::state::CrawlerState;
 use crate::stats::StatCollector;
-use crate::Downloader;
+
 use kanal::{AsyncReceiver, AsyncSender};
+use spider_middleware::middleware::MiddlewareAction;
+use spider_util::item::ScrapedItem;
+use spider_util::request::Request;
+use spider_util::response::Response;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -45,11 +62,25 @@ where
                 break;
             }
 
+            // Check for backpressure by monitoring response channel capacity
+            if res_tx.len() > max_concurrent_downloads * 2 {
+                trace!("High response channel occupancy detected, applying backpressure");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+
             let request = tokio::select! {
                 result = req_rx.recv() => {
                     match result {
                         Ok(req) => {
                             trace!("Received request for URL: {}", req.url);
+
+                            // Apply backpressure if response channel is filling up
+                            if res_tx.len() > max_concurrent_downloads {
+                                trace!("Applying backpressure, response channel occupancy: {}", res_tx.len());
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+
                             req
                         },
                         Err(_) => {

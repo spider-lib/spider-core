@@ -1,8 +1,11 @@
-use spider_util::item::ScrapedItem;
-use spider_pipeline::pipeline::Pipeline;
+//! Contains the item processor functionality for the crawler.
+//! This module handles the processing of scraped items through configured pipelines concurrently.
+
 use crate::state::CrawlerState;
 use crate::stats::StatCollector;
 use kanal::AsyncReceiver;
+use spider_pipeline::pipeline::Pipeline;
+use spider_util::item::ScrapedItem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::Semaphore;

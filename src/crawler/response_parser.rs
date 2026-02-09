@@ -1,12 +1,64 @@
-use spider_util::item::{ParseOutput, ScrapedItem};
-use spider_util::response::Response;
+//! # Response Parser Module
+//!
+//! Contains the response parsing functionality for the crawler.
+//!
+//! ## Overview
+//!
+//! The response parser module handles the processing of HTTP responses received
+//! from the downloader. It orchestrates the parsing of responses through the
+//! spider's logic, extracting scraped items and new requests to follow.
+//! The module implements a concurrent processing model with multiple parser
+//! workers to efficiently handle the parsing workload.
+//!
+//! ## Key Components
+//!
+//! - **spawn_parser_task**: Creates the main parser coordinator task and worker tasks
+//! - **process_crawl_outputs**: Handles the distribution of spider outputs (items and requests)
+//! - **Parser Workers**: Multiple concurrent tasks that process individual responses
+//! - **Coordinator**: Manages the distribution of responses to available workers
+//!
+//! ## Architecture
+//!
+//! The parser uses a coordinator-worker pattern where a coordinator task receives
+//! responses from the downloader and distributes them to multiple worker tasks.
+//! Each worker task processes responses through the spider's parsing logic,
+//! extracting items and new requests. This design allows for concurrent parsing
+//! while maintaining proper coordination and backpressure handling.
+//!
+//! ## Example
+//!
+//! ```rust,ignore
+//! use spider_core::crawler::spawn_parser_task;
+//! use spider_util::response::Response;
+//! use spider_util::item::ScrapedItem;
+//! use kanal::{AsyncReceiver, AsyncSender};
+//! use std::sync::Arc;
+//! use tokio::sync::Mutex;
+//!
+//! // The parser task is typically spawned internally by the crawler
+//! // but can be used directly if needed for custom implementations
+//! let parser_handle = spawn_parser_task(
+//!     scheduler,
+//!     spider,
+//!     state,
+//!     response_receiver,
+//!     item_sender,
+//!     num_parser_workers,
+//!     stats,
+//! );
+//! ```
+
 use crate::scheduler::Scheduler;
 use crate::spider::Spider;
 use crate::state::CrawlerState;
 use crate::stats::StatCollector;
 use kanal::{AsyncReceiver, AsyncSender};
+use spider_util::item::{ParseOutput, ScrapedItem};
+use spider_util::response::Response;
+use std::cmp::max;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace, warn};
 
@@ -64,6 +116,16 @@ where
         );
         while let Ok(response) = res_rx.recv().await {
             trace!("Received response for parsing from URL: {}", response.url);
+
+            // Apply backpressure if item channel is filling up
+            if item_tx.len() > parser_workers * max(2, parser_workers / 2) {
+                trace!(
+                    "Applying backpressure to parser, item channel occupancy: {}",
+                    item_tx.len()
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
             state.parsing_responses.fetch_add(1, Ordering::SeqCst);
             if internal_parse_tx.send(response).await.is_err() {
                 error!("Internal parse channel closed, cannot send response to parser worker.");

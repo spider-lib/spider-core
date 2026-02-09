@@ -32,13 +32,14 @@
 //! - `SharedMiddlewareManager`: Manages concurrent access to middlewares
 
 mod core;
-mod request_handler;
-mod response_parser;
 mod item_processor;
 mod middleware_manager;
+mod request_handler;
+mod response_parser;
 
-pub use core::{Crawler};
-pub(crate) use request_handler::{spawn_downloader_task};
-pub(crate) use response_parser::{spawn_parser_task};
-pub(crate) use item_processor::{spawn_item_processor_task};
+pub use core::Crawler;
+pub(crate) use item_processor::spawn_item_processor_task;
 pub(crate) use middleware_manager::SharedMiddlewareManager;
+pub(crate) use request_handler::spawn_downloader_task;
+pub(crate) use response_parser::spawn_parser_task;
+

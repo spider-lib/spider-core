@@ -10,19 +10,19 @@
 //! handling initial requests, downloading web pages, parsing responses, and
 //! processing scraped items.
 
-use spider_util::error::SpiderError;
-use spider_util::item::ScrapedItem;
-use spider_middleware::middleware::Middleware;
-use spider_pipeline::pipeline::Pipeline;
-use spider_util::request::Request;
+use crate::Downloader;
 use crate::scheduler::Scheduler;
 use crate::spider::Spider;
-use crate::Downloader;
 use crate::state::CrawlerState;
 use crate::stats::StatCollector;
 use anyhow::Result;
 use futures_util::future::join_all;
 use kanal::{AsyncReceiver, bounded_async};
+use spider_middleware::middleware::Middleware;
+use spider_pipeline::pipeline::Pipeline;
+use spider_util::error::SpiderError;
+use spider_util::item::ScrapedItem;
+use spider_util::request::Request;
 use tracing::{debug, error, info, trace, warn};
 
 #[cfg(feature = "checkpoint")]
@@ -30,10 +30,7 @@ use crate::checkpoint::save_checkpoint;
 #[cfg(feature = "checkpoint")]
 use std::path::PathBuf;
 
-use std::sync::{
-    Arc,
-    atomic::Ordering,
-};
+use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -129,13 +126,13 @@ where
             max_concurrent_downloads,
             parser_workers,
             max_concurrent_pipelines,
-            channel_capacity: _, // We don't need to use this value here
+            channel_capacity: _,
             checkpoint_path,
             checkpoint_interval,
             #[cfg(feature = "cookie-store")]
-            cookie_store: _,
+                cookie_store: _,
         } = self;
-        
+
         #[cfg(not(feature = "checkpoint"))]
         let Crawler {
             scheduler,
@@ -148,9 +145,9 @@ where
             max_concurrent_downloads,
             parser_workers,
             max_concurrent_pipelines,
-            channel_capacity: _, // We don't need to use this value here
+            channel_capacity: _,
             #[cfg(feature = "cookie-store")]
-            cookie_store: _,
+                cookie_store: _,
         } = self;
 
         let state = CrawlerState::new();
@@ -214,10 +211,10 @@ where
                 let scheduler_clone = scheduler.clone();
                 let pipelines_clone = pipelines.clone();
                 let path_clone = path.clone();
-                
+
                 #[cfg(feature = "cookie-store")]
                 let cookie_store_clone = self.cookie_store.clone();
-                
+
                 #[cfg(not(feature = "cookie-store"))]
                 let _cookie_store_clone = ();
 
@@ -234,10 +231,10 @@ where
                                 trace!("Checkpoint timer ticked, creating snapshot");
                                 if let Ok(scheduler_checkpoint) = scheduler_clone.snapshot().await {
                                     debug!("Scheduler snapshot created, saving checkpoint to {:?}", path_clone);
-                                    
+
                                     #[cfg(feature = "cookie-store")]
                                     let save_result = save_checkpoint::<S>(&path_clone, scheduler_checkpoint, &pipelines_clone, &cookie_store_clone).await;
-                                    
+
                                     #[cfg(not(feature = "cookie-store"))]
                                     let save_result = save_checkpoint::<S>(&path_clone, scheduler_checkpoint, &pipelines_clone, &()).await;
 
@@ -285,7 +282,7 @@ where
             debug!("Scheduler shutdown initiated successfully");
         }
 
-        let timeout_duration = Duration::from_secs(30); // Default timeout of 30 seconds
+        let timeout_duration = Duration::from_secs(30);
 
         let mut task_set = tokio::task::JoinSet::new();
         task_set.spawn(item_processor_task);
@@ -333,12 +330,19 @@ where
             if let Some(path) = &checkpoint_path {
                 debug!("Creating final checkpoint at {:?}", path);
                 let scheduler_checkpoint = scheduler.snapshot().await?;
-                
+
                 #[cfg(feature = "cookie-store")]
-                let result = save_checkpoint::<S>(path, scheduler_checkpoint, &pipelines, &self.cookie_store).await;
-                
+                let result = save_checkpoint::<S>(
+                    path,
+                    scheduler_checkpoint,
+                    &pipelines,
+                    &self.cookie_store,
+                )
+                .await;
+
                 #[cfg(not(feature = "cookie-store"))]
-                let result = save_checkpoint::<S>(path, scheduler_checkpoint, &pipelines, &()).await;
+                let result =
+                    save_checkpoint::<S>(path, scheduler_checkpoint, &pipelines, &()).await;
 
                 if let Err(e) = result {
                     error!("Final checkpoint save failed: {}", e);
