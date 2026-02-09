@@ -37,3 +37,4 @@ impl CrawlerState {
             && self.processing_items.load(Ordering::SeqCst) == 0
     }
 }
+

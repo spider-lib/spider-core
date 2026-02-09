@@ -1,19 +1,60 @@
-/// Module for managing crawler checkpoints.
-///
-/// This module defines the data structures (`SchedulerCheckpoint`, `Checkpoint`)
-/// and functions for saving and loading the state of a crawler. Checkpoints enable
-/// the crawler to gracefully recover from interruptions or to resume a crawl
-/// at a later time. They capture the state of the scheduler (pending requests,
-/// visited URLs, salvaged requests) and the item pipelines.
-use spider_util::error::SpiderError;
-use spider_util::item::ScrapedItem;
-use spider_pipeline::pipeline::Pipeline;
-use spider_util::request::Request;
+//! # Checkpoint Module
+//!
+//! Manages crawler checkpoints for saving and restoring crawl state.
+//!
+//! ## Overview
+//!
+//! The checkpoint module provides functionality for saving and restoring the
+//! complete state of a crawler. This enables crawlers to gracefully recover
+//! from interruptions, resume interrupted crawls, and persist progress across
+//! sessions. Checkpoints capture the state of various crawler components
+//! including the scheduler, item pipelines, and cookie stores.
+//!
+//! ## Key Components
+//!
+//! - **SchedulerCheckpoint**: Captures the state of the request scheduler
+//! - **Checkpoint**: Complete crawler state snapshot including scheduler, pipelines, and cookies
+//! - **save_checkpoint**: Function to serialize and save crawler state to disk
+//! - **Feature Integration**: Conditional compilation support for cookie stores
+//!
+//! ## Implementation Details
+//!
+//! The checkpoint system uses MessagePack (msgpack) serialization for efficient
+//! binary storage of crawler state. It handles the serialization of complex
+//! data structures like request queues, visited URL sets, and pipeline states.
+//! The system also manages temporary file creation to ensure atomic saves.
+//!
+//! ## Example
+//!
+//! ```rust,ignore
+//! use spider_core::checkpoint::save_checkpoint;
+//! use spider_core::scheduler::Scheduler;
+//! use spider_pipeline::pipeline::Pipeline;
+//! use std::sync::Arc;
+//! use std::path::Path;
+//!
+//! // Checkpoints are typically managed internally by the crawler
+//! // but can be used programmatically if needed
+//! let scheduler_checkpoint = scheduler.snapshot().await?;
+//! let pipelines_ref = Arc::new(pipelines);
+//!
+//! save_checkpoint(
+//!     &Path::new("./crawl.checkpoint"),
+//!     scheduler_checkpoint,
+//!     &pipelines_ref,
+//!     &cookie_store,
+//! ).await?;
+//! ```
+
 use crate::spider::Spider;
 use dashmap::DashSet;
 use rmp_serde;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use spider_pipeline::pipeline::Pipeline;
+use spider_util::error::SpiderError;
+use spider_util::item::ScrapedItem;
+use spider_util::request::Request;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
@@ -48,7 +89,7 @@ pub struct Checkpoint {
     #[cfg(feature = "cookie-store")]
     #[serde(default)]
     pub cookie_store: CookieStore,
-    
+
     /// Placeholder when cookie store is disabled
     #[cfg(not(feature = "cookie-store"))]
     #[serde(skip)]
@@ -109,3 +150,4 @@ where
     info!("Checkpoint saved successfully.");
     Ok(())
 }
+

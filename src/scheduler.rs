@@ -56,15 +56,20 @@ use tracing::{debug, error, info, trace, warn};
 enum SchedulerMessage {
     Enqueue(Box<Request>),
     MarkAsVisited(String),
+    MarkAsVisitedBatch(Vec<String>),
     Shutdown,
 }
 
 use spider_util::bloom_filter::BloomFilter;
 
+use tokio::sync::Notify;
+
 pub struct Scheduler {
     request_queue: SegQueue<Request>,
     visited_urls: Cache<String, bool>,
     bloom_filter: std::sync::Arc<parking_lot::RwLock<BloomFilter>>,
+    bloom_filter_buffer: Arc<std::sync::Mutex<Vec<String>>>,
+    bloom_filter_notify: Arc<Notify>,
     tx_internal: AsyncSender<SchedulerMessage>,
     pending_requests: AtomicUsize,
     salvaged_requests: SegQueue<Request>,
@@ -100,7 +105,13 @@ impl Scheduler {
                 request_queue.push(request);
             }
 
-            visited_urls = Cache::builder().max_capacity(100000).build();
+            visited_urls = Cache::builder()
+                .max_capacity(500000) // Increased cache size for better performance
+                .time_to_idle(std::time::Duration::from_secs(3600)) // Keep entries for 1 hour of inactivity
+                .eviction_listener(|_key, _value, _cause| {
+                    // Optional: Add metrics here if needed
+                })
+                .build();
             for url in state.visited_urls {
                 visited_urls.insert(url, true);
             }
@@ -112,20 +123,33 @@ impl Scheduler {
             }
         } else {
             request_queue = SegQueue::new();
-            visited_urls = Cache::builder().max_capacity(100000).build();
+            visited_urls = Cache::builder().max_capacity(200000).build(); // Increased cache size for better performance
             pending_requests = AtomicUsize::new(0);
             salvaged_requests = SegQueue::new();
         }
 
+        let bloom_filter_buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bloom_filter_notify = Arc::new(Notify::new());
+
         let scheduler = Arc::new(Scheduler {
             request_queue,
             visited_urls,
-            bloom_filter: std::sync::Arc::new(parking_lot::RwLock::new(BloomFilter::new(1000000, 3))),
+            bloom_filter: std::sync::Arc::new(parking_lot::RwLock::new(BloomFilter::new(5000000, 5))), // Increased size and hash functions for better accuracy
+            bloom_filter_buffer: bloom_filter_buffer.clone(),
+            bloom_filter_notify: bloom_filter_notify.clone(),
             tx_internal,
             pending_requests,
             salvaged_requests,
             is_shutting_down: AtomicBool::new(false),
-            max_pending_requests: 10000,
+            max_pending_requests: 30000, // Increased for better buffering
+        });
+
+        // Spawn background task to periodically flush the bloom filter buffer
+        let scheduler_clone_for_bloom = Arc::clone(&scheduler);
+        let bloom_filter_buffer_clone = bloom_filter_buffer.clone();
+        let bloom_filter_notify_clone = bloom_filter_notify.clone();
+        tokio::spawn(async move {
+            scheduler_clone_for_bloom.flush_bloom_filter_buffer(bloom_filter_buffer_clone, bloom_filter_notify_clone).await;
         });
 
         let scheduler_clone = Arc::clone(&scheduler);
@@ -146,19 +170,38 @@ impl Scheduler {
         let (tx_req_out, rx_req_out) = bounded_async(100);
 
         let request_queue = SegQueue::new();
-        let visited_urls = Cache::builder().max_capacity(100000).build();
+        let visited_urls = Cache::builder()
+            .max_capacity(500000) // Increased cache size for better performance
+            .time_to_idle(std::time::Duration::from_secs(3600)) // Keep entries for 1 hour of inactivity
+            .eviction_listener(|_key, _value, _cause| {
+                // Optional: Add metrics here if needed
+            })
+            .build();
         let pending_requests = AtomicUsize::new(0);
         let salvaged_requests = SegQueue::new();
+
+        let bloom_filter_buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bloom_filter_notify = Arc::new(Notify::new());
 
         let scheduler = Arc::new(Scheduler {
             request_queue,
             visited_urls,
-            bloom_filter: std::sync::Arc::new(parking_lot::RwLock::new(BloomFilter::new(1000000, 3))),
+            bloom_filter: std::sync::Arc::new(parking_lot::RwLock::new(BloomFilter::new(5000000, 5))), // Increased size and hash functions for better accuracy
+            bloom_filter_buffer: bloom_filter_buffer.clone(),
+            bloom_filter_notify: bloom_filter_notify.clone(),
             tx_internal,
             pending_requests,
             salvaged_requests,
             is_shutting_down: AtomicBool::new(false),
-            max_pending_requests: 10000,
+            max_pending_requests: 30000, // Increased for better buffering
+        });
+
+        // Spawn background task to periodically flush the bloom filter buffer
+        let scheduler_clone_for_bloom = Arc::clone(&scheduler);
+        let bloom_filter_buffer_clone = bloom_filter_buffer.clone();
+        let bloom_filter_notify_clone = bloom_filter_notify.clone();
+        tokio::spawn(async move {
+            scheduler_clone_for_bloom.flush_bloom_filter_buffer(bloom_filter_buffer_clone, bloom_filter_notify_clone).await;
         });
 
         let scheduler_clone = Arc::clone(&scheduler);
@@ -237,13 +280,45 @@ impl Scheduler {
             Ok(SchedulerMessage::MarkAsVisited(fingerprint)) => {
                 trace!("Marking URL fingerprint as visited: {}", fingerprint);
                 self.visited_urls.insert(fingerprint.clone(), true);
-                self.bloom_filter.write().add(&fingerprint);
+                
+                // Add to buffer instead of directly to bloom filter to reduce lock contention
+                {
+                    let mut buffer = self.bloom_filter_buffer.lock().unwrap();
+                    buffer.push(fingerprint.clone());
+                    if buffer.len() >= 100 { // Flush buffer when it reaches 100 items
+                        self.bloom_filter_notify.notify_one();
+                    }
+                }
+                
                 debug!("Marked URL as visited: {}", fingerprint);
+                true
+            }
+            Ok(SchedulerMessage::MarkAsVisitedBatch(fingerprints)) => {
+                let count = fingerprints.len();
+                trace!("Marking {} URL fingerprints as visited in batch", count);
+                for fingerprint in &fingerprints {
+                    self.visited_urls.insert(fingerprint.clone(), true);
+                }
+                
+                // Add all to buffer instead of directly to bloom filter
+                {
+                    let mut buffer = self.bloom_filter_buffer.lock().unwrap();
+                    buffer.extend(fingerprints);
+                    if buffer.len() >= 100 { // Flush buffer when it reaches 100 items
+                        self.bloom_filter_notify.notify_one();
+                    }
+                }
+                
+                debug!("Marked {} URLs as visited in batch", count);
                 true
             }
             Ok(SchedulerMessage::Shutdown) => {
                 info!("Scheduler received shutdown signal. Exiting run_loop.");
                 self.is_shutting_down.store(true, Ordering::SeqCst);
+                
+                // Flush remaining items in buffer before shutdown
+                self.flush_bloom_filter_buffer_now();
+                
                 false
             }
             Err(_) => {
@@ -395,13 +470,84 @@ impl Scheduler {
             })
     }
 
+    /// Sends a message to the scheduler to mark multiple URLs as visited in batch.
+    pub async fn send_mark_as_visited_batch(&self, fingerprints: Vec<String>) -> Result<(), SpiderError> {
+        if fingerprints.is_empty() {
+            return Ok(());
+        }
+        
+        trace!(
+            "Sending MarkAsVisitedBatch message for {} fingerprints",
+            fingerprints.len()
+        );
+        self.tx_internal
+            .send(SchedulerMessage::MarkAsVisitedBatch(fingerprints))
+            .await
+            .map_err(|e| {
+                if !self.is_shutting_down.load(Ordering::SeqCst) {
+                    error!("Scheduler internal message channel is closed. Failed to mark URLs as visited in batch: {}", e);
+                }
+                SpiderError::GeneralError(format!(
+                    "Scheduler: Failed to send MarkAsVisitedBatch message: {}",
+                    e
+                ))
+            })
+    }
+
     /// Checks if a URL has been visited using Bloom Filter for fast preliminary check
     pub fn has_been_visited(&self, fingerprint: &str) -> bool {
+        // Check the bloom filter first
         if !self.bloom_filter.read().might_contain(fingerprint) {
             return false;
         }
 
+        // Also check if it's in the buffer (for recently added items)
+        {
+            let buffer = self.bloom_filter_buffer.lock().unwrap();
+            if buffer.iter().any(|item| item == fingerprint) {
+                return true;
+            }
+        }
+
         self.visited_urls.contains_key(fingerprint)
+    }
+
+    /// Flushes all items in the bloom filter buffer to the actual bloom filter
+    fn flush_bloom_filter_buffer_now(&self) {
+        let mut buffer = self.bloom_filter_buffer.lock().unwrap();
+        if !buffer.is_empty() {
+            let items: Vec<String> = buffer.drain(..).collect();
+            drop(buffer); // Release the lock before taking the bloom filter lock
+            
+            let mut bloom_filter = self.bloom_filter.write();
+            for item in items {
+                bloom_filter.add(&item);
+            }
+        }
+    }
+
+    /// Background task to periodically flush the bloom filter buffer
+    async fn flush_bloom_filter_buffer(
+        &self,
+        _buffer: Arc<std::sync::Mutex<Vec<String>>>,
+        notify: Arc<Notify>,
+    ) {
+        loop {
+            // Wait for notification or timeout (every 100ms)
+            tokio::select! {
+                _ = notify.notified() => {
+                    // Notification received, flush the buffer
+                    self.flush_bloom_filter_buffer_now();
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                    // Timeout reached, flush the buffer anyway
+                    self.flush_bloom_filter_buffer_now();
+                }
+            }
+            
+            // Small delay to avoid busy waiting
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Checks if a request should be enqueued by checking if its fingerprint has already been visited

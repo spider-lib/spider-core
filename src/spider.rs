@@ -66,6 +66,8 @@ use spider_util::error::SpiderError;
 use spider_util::item::{ParseOutput, ScrapedItem};
 use spider_util::request::Request;
 use spider_util::response::Response;
+#[cfg(feature = "streaming")]
+use spider_util::streaming_response::StreamingResponse;
 use anyhow::Result;
 use async_trait::async_trait;
 use url::Url;
@@ -90,4 +92,13 @@ pub trait Spider: Send + Sync + 'static {
 
     /// Parses a response and extracts scraped items and new requests.
     async fn parse(&mut self, response: Response) -> Result<ParseOutput<Self::Item>, SpiderError>;
+
+    /// Parses a streaming response and extracts scraped items and new requests.
+    /// This method is optional and only available when the 'streaming' feature is enabled.
+    #[cfg(feature = "streaming")]
+    async fn parse_streaming(&mut self, response: StreamingResponse) -> Result<ParseOutput<Self::Item>, SpiderError> {
+        // Default implementation converts streaming response to regular response
+        let regular_response = response.to_response().await.map_err(|e| SpiderError::IoError(e.to_string()))?;
+        self.parse(regular_response).await
+    }
 }

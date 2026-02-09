@@ -39,14 +39,14 @@
 //! }
 //! ```
 
-use spider_util::error::SpiderError;
-use spider_middleware::middleware::Middleware;
-use spider_pipeline::pipeline::Pipeline;
-use crate::scheduler::Scheduler;
-use crate::spider::Spider;
 use crate::Downloader;
 use crate::ReqwestClientDownloader;
+use crate::scheduler::Scheduler;
+use crate::spider::Spider;
 use num_cpus;
+use spider_middleware::middleware::Middleware;
+use spider_pipeline::pipeline::Pipeline;
+use spider_util::error::SpiderError;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -60,9 +60,9 @@ use tracing::{debug, warn};
 #[cfg(feature = "checkpoint")]
 use crate::SchedulerCheckpoint;
 #[cfg(feature = "checkpoint")]
-use std::fs;
-#[cfg(feature = "checkpoint")]
 use rmp_serde;
+#[cfg(feature = "checkpoint")]
+use std::fs;
 
 /// Configuration for the crawler's concurrency settings.
 pub struct CrawlerConfig {
@@ -79,10 +79,10 @@ pub struct CrawlerConfig {
 impl Default for CrawlerConfig {
     fn default() -> Self {
         CrawlerConfig {
-            max_concurrent_downloads: 5,
-            parser_workers: num_cpus::get(),
-            max_concurrent_pipelines: 5,
-            channel_capacity: 200,
+            max_concurrent_downloads: num_cpus::get().max(16),
+            parser_workers: num_cpus::get().clamp(4, 16),
+            max_concurrent_pipelines: num_cpus::get().min(8),
+            channel_capacity: 1000,
         }
     }
 }
@@ -200,7 +200,7 @@ impl<S: Spider, D: Downloader> CrawlerBuilder<S, D> {
         // Add a default ConsoleWriter pipeline if none are provided
         if self.item_pipelines.is_empty() {
             use spider_pipeline::console_writer::ConsoleWriterPipeline;
-            self.item_pipelines.push(Box::new(ConsoleWriterPipeline::new()));
+            self = self.add_pipeline(ConsoleWriterPipeline::new());
         }
 
         #[cfg(all(feature = "checkpoint", feature = "cookie-store"))]
@@ -224,9 +224,11 @@ impl<S: Spider, D: Downloader> CrawlerBuilder<S, D> {
                 self.checkpoint_path.take(),
                 self.checkpoint_interval,
                 stats,
-                Arc::new(tokio::sync::RwLock::new(loaded_cookie_store.unwrap_or_default())),
+                Arc::new(tokio::sync::RwLock::new(
+                    loaded_cookie_store.unwrap_or_default(),
+                )),
             );
-            return Ok(crawler);
+            Ok(crawler)
         }
 
         #[cfg(all(feature = "checkpoint", not(feature = "cookie-store")))]
@@ -273,7 +275,9 @@ impl<S: Spider, D: Downloader> CrawlerBuilder<S, D> {
                 self.crawler_config.max_concurrent_pipelines,
                 self.crawler_config.channel_capacity,
                 stats,
-                Arc::new(tokio::sync::RwLock::new(loaded_cookie_store.unwrap_or_default())),
+                Arc::new(tokio::sync::RwLock::new(
+                    loaded_cookie_store.unwrap_or_default(),
+                )),
             );
             return Ok(crawler);
         }
@@ -405,3 +409,4 @@ impl<S: Spider, D: Downloader> CrawlerBuilder<S, D> {
         })
     }
 }
+

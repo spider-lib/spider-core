@@ -23,4 +23,8 @@ pub use crate::{
 
 // Import types from other crates
 pub use spider_middleware::middleware::{Middleware, MiddlewareAction};
-pub use spider_util::{error::{SpiderError, PipelineError}, request::Request};
+pub use spider_util::{
+    error::{PipelineError, SpiderError},
+    request::Request,
+};
+

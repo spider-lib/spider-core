@@ -67,11 +67,28 @@ struct StatsSnapshot {
     items_dropped_by_pipeline: usize,
     response_status_counts: HashMap<u16, usize>,
     elapsed_duration: Duration,
+    average_request_time: Option<Duration>,
+    fastest_request_time: Option<Duration>,
+    slowest_request_time: Option<Duration>,
+    request_time_count: usize,
 }
 
 impl StatsSnapshot {
     fn formatted_duration(&self) -> String {
         format!("{:?}", self.elapsed_duration)
+    }
+
+    fn formatted_request_time(&self, duration: Option<Duration>) -> String {
+        match duration {
+            Some(d) => {
+                if d.as_millis() < 1000 {
+                    format!("{} ms", d.as_millis())
+                } else {
+                    format!("{:.2} s", d.as_secs_f64())
+                }
+            }
+            None => "N/A".to_string(),
+        }
     }
 
     fn requests_per_second(&self) -> f64 {
@@ -196,6 +213,10 @@ impl StatCollector {
             items_dropped_by_pipeline: self.items_dropped_by_pipeline.load(Ordering::SeqCst),
             response_status_counts: status_counts,
             elapsed_duration: self.start_time.elapsed(),
+            average_request_time: self.average_request_time(),
+            fastest_request_time: self.fastest_request_time(),
+            slowest_request_time: self.slowest_request_time(),
+            request_time_count: self.request_time_count(),
         }
     }
 
@@ -267,9 +288,59 @@ impl StatCollector {
     }
 
     /// Records the time taken for a request.
-    #[allow(dead_code)]
-    pub(crate) fn record_request_time(&self, url: &str, duration: Duration) {
+    pub fn record_request_time(&self, url: &str, duration: Duration) {
         self.request_times.insert(url.to_string(), duration);
+    }
+
+    /// Calculates the average request time across all recorded requests.
+    pub fn average_request_time(&self) -> Option<Duration> {
+        let times: Vec<Duration> = self
+            .request_times
+            .iter()
+            .map(|entry| *entry.value())
+            .collect();
+        if times.is_empty() {
+            None
+        } else {
+            let total_nanos: u128 = times.iter().map(|d| d.as_nanos()).sum();
+            let avg_nanos = total_nanos / times.len() as u128;
+            Some(Duration::from_nanos(avg_nanos as u64))
+        }
+    }
+
+    /// Gets the fastest request time among all recorded requests.
+    pub fn fastest_request_time(&self) -> Option<Duration> {
+        self.request_times.iter().map(|entry| *entry.value()).min()
+    }
+
+    /// Gets the slowest request time among all recorded requests.
+    pub fn slowest_request_time(&self) -> Option<Duration> {
+        self.request_times.iter().map(|entry| *entry.value()).max()
+    }
+
+    /// Gets the total number of recorded request times.
+    pub fn request_time_count(&self) -> usize {
+        self.request_times.len()
+    }
+
+    /// Gets the request time for a specific URL.
+    pub fn get_request_time(&self, url: &str) -> Option<Duration> {
+        self.request_times
+            .get(url)
+            .map(|duration| *duration.value())
+    }
+
+    /// Gets all recorded request times as a vector of (URL, Duration) pairs.
+    pub fn get_all_request_times(&self) -> Vec<(String, Duration)> {
+        self.request_times
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect()
+    }
+
+    /// Clears all recorded request times.
+    pub fn clear_request_times(&self) {
+        self.request_times.clear();
     }
 
     /// Converts the snapshot into a JSON string.
@@ -328,6 +399,14 @@ impl StatCollector {
 | Processed  | {}     |
 | Dropped    | {}     |
 
+## Request Times
+| Metric           | Value      |
+|------------------|------------|
+| Average Time     | {}         |
+| Fastest Request  | {}         |
+| Slowest Request  | {}         |
+| Total Recorded   | {}         |
+
 ## Status Codes
 {}
 "#,
@@ -347,6 +426,10 @@ impl StatCollector {
             snapshot.items_scraped,
             snapshot.items_processed,
             snapshot.items_dropped_by_pipeline,
+            snapshot.formatted_request_time(snapshot.average_request_time),
+            snapshot.formatted_request_time(snapshot.fastest_request_time),
+            snapshot.formatted_request_time(snapshot.slowest_request_time),
+            snapshot.request_time_count,
             status_codes_output
         )
     }
@@ -393,6 +476,14 @@ impl std::fmt::Display for StatCollector {
             f,
             "  items    : scraped: {}, processed: {}, dropped: {}",
             snapshot.items_scraped, snapshot.items_processed, snapshot.items_dropped_by_pipeline
+        )?;
+        writeln!(
+            f,
+            "  times    : avg: {}, fastest: {}, slowest: {}, total: {}",
+            snapshot.formatted_request_time(snapshot.average_request_time),
+            snapshot.formatted_request_time(snapshot.fastest_request_time),
+            snapshot.formatted_request_time(snapshot.slowest_request_time),
+            snapshot.request_time_count
         )?;
 
         let status_string = if snapshot.response_status_counts.is_empty() {
