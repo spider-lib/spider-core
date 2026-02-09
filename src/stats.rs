@@ -49,6 +49,41 @@ use std::{
     },
     time::{Duration, Instant},
 };
+// Thread-safe exponential moving average for tracking recent rates
+#[derive(Debug)]
+pub(crate) struct ExpMovingAverage {
+    alpha: f64,  // Smoothing factor (typically 0.1-0.3)
+    rate: Arc<parking_lot::RwLock<f64>>,
+    last_update: Arc<parking_lot::RwLock<Instant>>,
+}
+
+impl ExpMovingAverage {
+    fn new(alpha: f64) -> Self {
+        ExpMovingAverage {
+            alpha,
+            rate: Arc::new(parking_lot::RwLock::new(0.0)),
+            last_update: Arc::new(parking_lot::RwLock::new(Instant::now())),
+        }
+    }
+
+    fn update(&self, count: usize) {
+        let now = Instant::now();
+        let mut last_update = self.last_update.write();
+        let time_delta = now.duration_since(*last_update).as_secs_f64();
+        *last_update = now;
+        
+        if time_delta > 0.0 {
+            let current_rate = count as f64 / time_delta;
+            let mut rate = self.rate.write();
+            // Apply exponential moving average formula
+            *rate = self.alpha * current_rate + (1.0 - self.alpha) * (*rate);
+        }
+    }
+
+    fn get_rate(&self) -> f64 {
+        *self.rate.read()
+    }
+}
 
 // A snapshot of the current statistics, used for reporting.
 // This avoids code duplication in the various export/display methods.
@@ -71,6 +106,11 @@ struct StatsSnapshot {
     fastest_request_time: Option<Duration>,
     slowest_request_time: Option<Duration>,
     request_time_count: usize,
+    
+    // Recent rates from sliding windows
+    recent_requests_per_second: f64,
+    recent_responses_per_second: f64,
+    recent_items_per_second: f64,
 }
 
 impl StatsSnapshot {
@@ -92,30 +132,15 @@ impl StatsSnapshot {
     }
 
     fn requests_per_second(&self) -> f64 {
-        let total_seconds = self.elapsed_duration.as_secs();
-        if total_seconds > 0 {
-            self.requests_sent as f64 / total_seconds as f64
-        } else {
-            0.0
-        }
+        self.recent_requests_per_second
     }
 
     fn responses_per_second(&self) -> f64 {
-        let total_seconds = self.elapsed_duration.as_secs();
-        if total_seconds > 0 {
-            self.responses_received as f64 / total_seconds as f64
-        } else {
-            0.0
-        }
+        self.recent_responses_per_second
     }
 
     fn items_per_second(&self) -> f64 {
-        let total_seconds = self.elapsed_duration.as_secs();
-        if total_seconds > 0 {
-            self.items_scraped as f64 / total_seconds as f64
-        } else {
-            0.0
-        }
+        self.recent_items_per_second
     }
 
     fn formatted_bytes(&self) -> String {
@@ -165,6 +190,22 @@ pub struct StatCollector {
 
     // Timing metrics
     pub request_times: Arc<dashmap::DashMap<String, Duration>>,
+    
+    // Exponential moving average metrics for accurate speed calculations
+    #[serde(skip)]
+    requests_sent_ema: ExpMovingAverage,
+    #[serde(skip)]
+    responses_received_ema: ExpMovingAverage,
+    #[serde(skip)]
+    items_scraped_ema: ExpMovingAverage,
+    
+    // Track previous counts for rate calculation
+    #[serde(skip)]
+    prev_requests_sent: AtomicUsize,
+    #[serde(skip)]
+    prev_responses_received: AtomicUsize,
+    #[serde(skip)]
+    prev_items_scraped: AtomicUsize,
 }
 
 impl StatCollector {
@@ -186,6 +227,15 @@ impl StatCollector {
             items_processed: AtomicUsize::new(0),
             items_dropped_by_pipeline: AtomicUsize::new(0),
             request_times: Arc::new(dashmap::DashMap::new()),
+            // Initialize exponential moving averages for recent speed calculations (alpha = 0.2 for good balance)
+            requests_sent_ema: ExpMovingAverage::new(0.2),
+            responses_received_ema: ExpMovingAverage::new(0.2),
+            items_scraped_ema: ExpMovingAverage::new(0.2),
+            
+            // Initialize previous counts to 0
+            prev_requests_sent: AtomicUsize::new(0),
+            prev_responses_received: AtomicUsize::new(0),
+            prev_items_scraped: AtomicUsize::new(0),
         }
     }
 
@@ -197,6 +247,11 @@ impl StatCollector {
             let (key, value) = entry.pair();
             status_counts.insert(*key, *value);
         }
+
+        // Get recent rates from exponential moving averages
+        let recent_requests_per_second = self.requests_sent_ema.get_rate();
+        let recent_responses_per_second = self.responses_received_ema.get_rate();
+        let recent_items_per_second = self.items_scraped_ema.get_rate();
 
         StatsSnapshot {
             requests_enqueued: self.requests_enqueued.load(Ordering::SeqCst),
@@ -217,6 +272,11 @@ impl StatCollector {
             fastest_request_time: self.fastest_request_time(),
             slowest_request_time: self.slowest_request_time(),
             request_time_count: self.request_time_count(),
+            
+            // Recent rates from sliding windows
+            recent_requests_per_second,
+            recent_responses_per_second,
+            recent_items_per_second,
         }
     }
 
@@ -227,7 +287,13 @@ impl StatCollector {
 
     /// Increments the count of sent requests.
     pub(crate) fn increment_requests_sent(&self) {
-        self.requests_sent.fetch_add(1, Ordering::SeqCst);
+        let new_count = self.requests_sent.fetch_add(1, Ordering::SeqCst) + 1;
+        // Calculate how many requests were sent since the last update
+        let prev_count = self.prev_requests_sent.load(Ordering::SeqCst);
+        let delta = new_count - prev_count;
+        self.requests_sent_ema.update(delta);
+        // Update the previous count
+        self.prev_requests_sent.store(new_count, Ordering::SeqCst);
     }
 
     /// Increments the count of successful requests.
@@ -252,7 +318,13 @@ impl StatCollector {
 
     /// Increments the count of received responses.
     pub(crate) fn increment_responses_received(&self) {
-        self.responses_received.fetch_add(1, Ordering::SeqCst);
+        let new_count = self.responses_received.fetch_add(1, Ordering::SeqCst) + 1;
+        // Calculate how many responses were received since the last update
+        let prev_count = self.prev_responses_received.load(Ordering::SeqCst);
+        let delta = new_count - prev_count;
+        self.responses_received_ema.update(delta);
+        // Update the previous count
+        self.prev_responses_received.store(new_count, Ordering::SeqCst);
     }
 
     /// Increments the count of responses served from cache.
@@ -266,6 +338,7 @@ impl StatCollector {
     }
 
     /// Adds to the total bytes downloaded.
+    #[cfg(not(feature = "stream"))]
     pub(crate) fn add_bytes_downloaded(&self, bytes: usize) {
         self.total_bytes_downloaded
             .fetch_add(bytes, Ordering::SeqCst);
@@ -273,7 +346,13 @@ impl StatCollector {
 
     /// Increments the count of scraped items.
     pub(crate) fn increment_items_scraped(&self) {
-        self.items_scraped.fetch_add(1, Ordering::SeqCst);
+        let new_count = self.items_scraped.fetch_add(1, Ordering::SeqCst) + 1;
+        // Calculate how many items were scraped since the last update
+        let prev_count = self.prev_items_scraped.load(Ordering::SeqCst);
+        let delta = new_count - prev_count;
+        self.items_scraped_ema.update(delta);
+        // Update the previous count
+        self.prev_items_scraped.store(new_count, Ordering::SeqCst);
     }
 
     /// Increments the count of processed items.
@@ -373,7 +452,8 @@ impl StatCollector {
             r#"# Crawl Statistics Report
 
 - **Duration**: {}
-- **Average Speed**: {:.2} req/s, {:.2} resp/s, {:.2} item/s
+- **Current Rate** (last 10s): {:.2} req/s, {:.2} resp/s, {:.2} item/s
+- **Overall Rate** (total): {:.2} req/s, {:.2} resp/s, {:.2} item/s
 
 ## Requests
 | Metric     | Count |
@@ -414,6 +494,19 @@ impl StatCollector {
             snapshot.requests_per_second(),
             snapshot.responses_per_second(),
             snapshot.items_per_second(),
+            // Calculate cumulative speeds for comparison
+            {
+                let total_seconds = snapshot.elapsed_duration.as_secs() as f64;
+                if total_seconds > 0.0 { snapshot.requests_sent as f64 / total_seconds } else { 0.0 }
+            },
+            {
+                let total_seconds = snapshot.elapsed_duration.as_secs() as f64;
+                if total_seconds > 0.0 { snapshot.responses_received as f64 / total_seconds } else { 0.0 }
+            },
+            {
+                let total_seconds = snapshot.elapsed_duration.as_secs() as f64;
+                if total_seconds > 0.0 { snapshot.items_scraped as f64 / total_seconds } else { 0.0 }
+            },
             snapshot.requests_enqueued,
             snapshot.requests_sent,
             snapshot.requests_succeeded,

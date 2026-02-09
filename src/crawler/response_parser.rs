@@ -91,18 +91,43 @@ where
         tasks.spawn(async move {
             while let Ok(response) = internal_parse_rx_clone.recv().await {
                 debug!("Parsing response from {}", response.url);
-                match spider_clone.lock().await.parse(response).await {
-                    Ok(outputs) => {
-                        process_crawl_outputs::<S>(
-                            outputs,
-                            scheduler_clone.clone(),
-                            item_tx_clone.clone(),
-                            state_clone.clone(),
-                            stats_clone.clone(),
-                        )
-                        .await;
+
+                #[cfg(not(feature = "stream"))]
+                {
+                    let parse_output = spider_clone.lock().await.parse(response).await;
+                    match parse_output {
+                        Ok(outputs) => {
+                            process_crawl_outputs::<S>(
+                                outputs,
+                                scheduler_clone.clone(),
+                                item_tx_clone.clone(),
+                                state_clone.clone(),
+                                stats_clone.clone(),
+                            )
+                            .await;
+                        }
+                        Err(e) => error!("Spider parsing error: {:?}", e),
                     }
-                    Err(e) => error!("Spider parsing error: {:?}", e),
+                }
+                #[cfg(feature = "stream")]
+                {
+                    // For now, we'll continue using the regular parse method
+                    // In a more sophisticated implementation, we might want to check
+                    // if this response should be handled as a stream response
+                    let parse_output = spider_clone.lock().await.parse(response).await;
+                    match parse_output {
+                        Ok(outputs) => {
+                            process_crawl_outputs::<S>(
+                                outputs,
+                                scheduler_clone.clone(),
+                                item_tx_clone.clone(),
+                                state_clone.clone(),
+                                stats_clone.clone(),
+                            )
+                            .await;
+                        }
+                        Err(e) => error!("Spider parsing error: {:?}", e),
+                    }
                 }
                 state_clone.parsing_responses.fetch_sub(1, Ordering::SeqCst);
             }

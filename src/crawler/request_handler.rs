@@ -244,22 +244,58 @@ where
 
             // Measure request time
             let start_time = std::time::Instant::now();
-            match downloader.download(request_for_download).await {
+            
+            #[cfg(not(feature = "stream"))]
+            let download_result = downloader.download(request_for_download).await;
+            
+            #[cfg(feature = "stream")]
+            let download_result = downloader.download_stream(request_for_download).await;
+
+            match download_result {
                 Ok(resp) => {
-                    let duration = start_time.elapsed();
-                    trace!(
-                        "Download successful for URL: {}, took {:?}",
-                        resp.url, duration
-                    );
+                    #[cfg(not(feature = "stream"))]
+                    {
+                        let duration = start_time.elapsed();
+                        trace!(
+                            "Download successful for URL: {}, took {:?}",
+                            resp.url, duration
+                        );
 
-                    // Record the request time
-                    stats.record_request_time(&resp.url.to_string(), duration);
+                        // Record the request time
+                        stats.record_request_time(&resp.url.to_string(), duration);
 
-                    stats.increment_requests_succeeded();
-                    stats.increment_responses_received();
-                    stats.record_response_status(resp.status.as_u16());
-                    stats.add_bytes_downloaded(resp.body.len());
-                    resp
+                        stats.increment_requests_succeeded();
+                        stats.increment_responses_received();
+                        stats.record_response_status(resp.status.as_u16());
+                        stats.add_bytes_downloaded(resp.body.len());
+                        resp
+                    }
+                    
+                    #[cfg(feature = "stream")]
+                    {
+                        let duration = start_time.elapsed();
+                        trace!(
+                            "Stream download successful for URL: {}, took {:?}",
+                            resp.url, duration
+                        );
+
+                        // Record the request time
+                        stats.record_request_time(&resp.url.to_string(), duration);
+
+                        stats.increment_requests_succeeded();
+                        stats.increment_responses_received();
+                        stats.record_response_status(resp.status.as_u16());
+                        
+                        // Convert StreamResponse to Response for compatibility with the rest of the system
+                        match resp.to_response().await {
+                            Ok(converted_resp) => converted_resp,
+                            Err(e) => {
+                                error!("Failed to convert stream response to regular response for URL {}: {:?}", request_url, e);
+                                state.in_flight_requests.fetch_sub(1, Ordering::SeqCst);
+                                return Ok(None);
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     let duration = start_time.elapsed();

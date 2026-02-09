@@ -66,8 +66,11 @@ use spider_util::error::SpiderError;
 use spider_util::item::{ParseOutput, ScrapedItem};
 use spider_util::request::Request;
 use spider_util::response::Response;
-#[cfg(feature = "streaming")]
-use spider_util::streaming_response::StreamingResponse;
+#[cfg(feature = "stream")]
+use spider_util::stream_response::StreamResponse;
+#[cfg(not(feature = "stream"))]
+pub struct StreamResponse;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use url::Url;
@@ -91,14 +94,25 @@ pub trait Spider: Send + Sync + 'static {
     }
 
     /// Parses a response and extracts scraped items and new requests.
+    #[cfg(feature = "stream")]
+    async fn parse(&mut self, _response: Response) -> Result<ParseOutput<Self::Item>, SpiderError> {
+        Ok(ParseOutput::new())
+    }
+
+    /// Parses a stream response and extracts scraped items and new requests.
+    /// This method is optional and only available when the 'stream' feature is enabled.
+    #[cfg(feature = "stream")]
+    async fn parse_stream(&mut self, response: StreamResponse) -> Result<ParseOutput<Self::Item>, SpiderError>;
+
+    /// Parses a response and extracts scraped items and new requests.
+    #[cfg(not(feature = "stream"))]
     async fn parse(&mut self, response: Response) -> Result<ParseOutput<Self::Item>, SpiderError>;
 
-    /// Parses a streaming response and extracts scraped items and new requests.
-    /// This method is optional and only available when the 'streaming' feature is enabled.
-    #[cfg(feature = "streaming")]
-    async fn parse_streaming(&mut self, response: StreamingResponse) -> Result<ParseOutput<Self::Item>, SpiderError> {
-        // Default implementation converts streaming response to regular response
-        let regular_response = response.to_response().await.map_err(|e| SpiderError::IoError(e.to_string()))?;
-        self.parse(regular_response).await
+    /// Parses a stream response and extracts scraped items and new requests.
+    /// This method is optional and only available when the 'stream' feature is enabled.
+    #[cfg(not(feature = "stream"))]
+    async fn parse_stream(&mut self, _response: StreamResponse) -> Result<ParseOutput<Self::Item>, SpiderError> {
+        Ok(ParseOutput::new())
     }
+
 }
