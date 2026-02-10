@@ -338,7 +338,6 @@ impl StatCollector {
     }
 
     /// Adds to the total bytes downloaded.
-    #[cfg(not(feature = "stream"))]
     pub(crate) fn add_bytes_downloaded(&self, bytes: usize) {
         self.total_bytes_downloaded
             .fetch_add(bytes, Ordering::SeqCst);
