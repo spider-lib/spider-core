@@ -1,6 +1,6 @@
 [package]
 name = "spider-core"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 authors = ["mzyui <mzyui@proton.me>"]
 description = "Core functionality for the spider-lib web scraping framework."
