@@ -59,7 +59,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{info, warn};
+use log::{info, warn};
 
 #[cfg(feature = "cookie-store")]
 use tokio::sync::RwLock;

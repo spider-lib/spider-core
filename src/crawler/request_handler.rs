@@ -20,7 +20,9 @@ use crate::scheduler::Scheduler;
 use crate::state::CrawlerState;
 use crate::stats::StatCollector;
 
+use crate::concurrency::AdaptiveSemaphore;
 use kanal::{AsyncReceiver, AsyncSender};
+use log::{debug, error, trace};
 use spider_middleware::middleware::MiddlewareAction;
 use spider_util::item::ScrapedItem;
 use spider_util::request::Request;
@@ -28,9 +30,8 @@ use spider_util::response::Response;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::{debug, error, trace, warn};
+use tokio::time::Instant;
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_downloader_task<S, C>(
@@ -48,8 +49,21 @@ where
     S::Item: ScrapedItem,
     C: Send + Sync + Clone + 'static,
 {
-    let semaphore = Arc::new(Semaphore::new(max_concurrent_downloads));
+    let adaptive_semaphore = Arc::new(AdaptiveSemaphore::new(
+        max_concurrent_downloads,
+        max_concurrent_downloads * 2,
+        1,
+    ));
     let mut tasks = JoinSet::new();
+
+    // Spawn a task to periodically adjust the semaphore permits based on performance
+    let adaptive_semaphore_clone = Arc::clone(&adaptive_semaphore);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            adaptive_semaphore_clone.adjust_permits().await;
+        }
+    });
 
     tokio::spawn(async move {
         trace!(
@@ -94,16 +108,12 @@ where
                 }
             };
 
-            let permit = match semaphore.clone().acquire_owned().await {
-                Ok(permit) => {
-                    trace!("Acquired download permit for URL: {}", request.url);
-                    permit
-                }
-                Err(_) => {
-                    warn!("Semaphore closed, shutting down downloader actor.");
-                    break;
-                }
-            };
+            // Use adaptive semaphore to acquire permits
+            let current_permits = adaptive_semaphore.current_permits().await;
+            if current_permits == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
 
             state.in_flight_requests.fetch_add(1, Ordering::SeqCst);
             let downloader_clone = Arc::clone(&downloader);
@@ -112,8 +122,12 @@ where
             let state_clone = Arc::clone(&state);
             let scheduler_clone = Arc::clone(&scheduler);
             let stats_clone = Arc::clone(&stats);
+            let adaptive_semaphore_clone = Arc::clone(&adaptive_semaphore);
 
             tasks.spawn(async move {
+                let start_time = Instant::now();
+                let host = request.url.host_str().unwrap_or("unknown").to_string();
+
                 trace!("Processing request through middlewares: {}", request.url);
                 let response = process_request_through_middlewares::<S, C>(
                     request,
@@ -121,9 +135,15 @@ where
                     &middlewares_clone,
                     &scheduler_clone,
                     &stats_clone,
-                    &state_clone,
                 )
                 .await;
+
+                // Update performance metrics for adaptive concurrency
+                let response_time = start_time.elapsed();
+                let success = response.is_ok() && response.as_ref().unwrap().is_some();
+                adaptive_semaphore_clone
+                    .update_metrics(&host, response_time, success)
+                    .await;
 
                 if let Ok(Some(final_response)) = response {
                     trace!("Sending response for URL: {}", final_response.url);
@@ -135,8 +155,6 @@ where
                 state_clone
                     .in_flight_requests
                     .fetch_sub(1, Ordering::SeqCst);
-                trace!("Released download permit for URL");
-                drop(permit);
             });
         }
 
@@ -158,7 +176,6 @@ async fn process_request_through_middlewares<S, C>(
     middlewares: &SharedMiddlewareManager<C>,
     scheduler: &Arc<Scheduler>,
     stats: &Arc<StatCollector>,
-    state: &Arc<CrawlerState>,
 ) -> Result<Option<Response>, ()>
 where
     S: crate::spider::Spider + 'static,
@@ -193,7 +210,6 @@ where
                     request_url
                 );
             }
-            state.in_flight_requests.fetch_sub(1, Ordering::SeqCst);
             return Ok(None);
         }
         Ok(MiddlewareAction::Drop) => {
@@ -202,7 +218,6 @@ where
                 original_request_url
             );
             stats.increment_requests_dropped();
-            state.in_flight_requests.fetch_sub(1, Ordering::SeqCst);
             return Ok(None);
         }
         Ok(MiddlewareAction::ReturnResponse(resp)) => {
@@ -217,7 +232,6 @@ where
                 "Request middleware error for URL {}: {:?}",
                 original_request_url, e
             );
-            state.in_flight_requests.fetch_sub(1, Ordering::SeqCst);
             return Ok(None);
         }
     }
@@ -256,7 +270,7 @@ where
                     );
 
                     // Record the request time
-                    stats.record_request_time(&resp.url.to_string(), duration);
+                    stats.record_request_time(resp.url.as_ref(), duration);
 
                     stats.increment_requests_succeeded();
                     stats.increment_responses_received();
@@ -272,11 +286,10 @@ where
                     );
 
                     // Still record the time even for failed requests
-                    stats.record_request_time(&request_url.to_string(), duration);
+                    stats.record_request_time(request_url.as_ref(), duration);
 
                     error!("Download error for URL {}: {:?}", request_url, e);
                     stats.increment_requests_failed();
-                    state.in_flight_requests.fetch_sub(1, Ordering::SeqCst);
                     return Ok(None);
                 }
             }
@@ -307,8 +320,7 @@ where
                     request_url
                 );
             }
-            state.in_flight_requests.fetch_sub(1, Ordering::SeqCst);
-            return Ok(None);
+            return Err(());
         }
         Ok(MiddlewareAction::Drop) => {
             debug!(
@@ -316,8 +328,7 @@ where
                 original_request_url
             );
             stats.increment_requests_dropped();
-            state.in_flight_requests.fetch_sub(1, Ordering::SeqCst);
-            return Ok(None);
+            return Err(());
         }
         Ok(MiddlewareAction::ReturnResponse(_)) => {
             // This indicates the middleware has fully handled or consumed the response.
@@ -333,7 +344,6 @@ where
                 "Response middleware error for URL {}: {:?}",
                 original_request_url, e
             );
-            state.in_flight_requests.fetch_sub(1, Ordering::SeqCst);
             return Ok(None);
         }
     };

@@ -55,7 +55,7 @@ use std::time::Duration;
 use super::Crawler;
 use crate::stats::StatCollector;
 #[cfg(feature = "checkpoint")]
-use tracing::{debug, warn};
+use log::{debug, warn};
 
 #[cfg(feature = "checkpoint")]
 use crate::SchedulerCheckpoint;

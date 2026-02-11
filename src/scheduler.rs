@@ -51,7 +51,7 @@ use kanal::{AsyncReceiver, AsyncSender, bounded_async, unbounded_async};
 use moka::sync::Cache;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tracing::{debug, error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 
 enum SchedulerMessage {
     Enqueue(Box<Request>),

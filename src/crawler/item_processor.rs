@@ -4,13 +4,17 @@
 use crate::state::CrawlerState;
 use crate::stats::StatCollector;
 use kanal::AsyncReceiver;
+use log::{debug, error, trace, warn};
 use spider_pipeline::pipeline::Pipeline;
 use spider_util::item::ScrapedItem;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::{debug, error, trace, warn};
+use tokio::time::Instant;
 
 pub fn spawn_item_processor_task<S>(
     state: Arc<CrawlerState>,
@@ -25,6 +29,8 @@ where
 {
     let mut tasks = JoinSet::new();
     let semaphore = Arc::new(Semaphore::new(max_concurrent_pipelines));
+    let pipeline_stats = Arc::new(RwLock::new(HashMap::new()));
+
     trace!(
         "Starting item processor with max_concurrent_pipelines: {}",
         max_concurrent_pipelines
@@ -46,34 +52,77 @@ where
             let state_clone = Arc::clone(&state);
             let pipelines_clone = Arc::clone(&pipelines);
             let stats_clone = Arc::clone(&stats);
+            let pipeline_stats_clone = Arc::clone(&pipeline_stats);
+
             tasks.spawn(async move {
                 trace!(
                     "Processing item through {} pipelines",
                     pipelines_clone.len()
                 );
-                let mut item_to_process = Some(item);
 
+                let mut item_to_process = Some(item);
                 for (idx, pipeline) in pipelines_clone.iter().enumerate() {
-                    if let Some(item) = item_to_process.take() {
+                    if let Some(current_item) = item_to_process.take() {
+                        let start_time = Instant::now();
+
                         trace!(
                             "Processing item through pipeline '{}' ({} of {})",
                             pipeline.name(),
                             idx + 1,
                             pipelines_clone.len()
                         );
-                        match pipeline.process_item(item).await {
+
+                        match pipeline.process_item(current_item).await {
                             Ok(Some(next_item)) => {
                                 trace!("Pipeline '{}' returned processed item", pipeline.name());
+
+                                // Record pipeline processing time
+                                let elapsed = start_time.elapsed();
+                                {
+                                    let mut stats_map = pipeline_stats_clone.write().await;
+                                    let pipeline_name = pipeline.name().to_string();
+                                    let (total_time, count) = stats_map
+                                        .entry(pipeline_name)
+                                        .or_insert((Duration::new(0, 0), 0));
+                                    *total_time += elapsed;
+                                    *count += 1;
+                                }
+
                                 item_to_process = Some(next_item);
                             }
                             Ok(None) => {
                                 debug!("Pipeline '{}' dropped item", pipeline.name());
                                 stats_clone.increment_items_dropped_by_pipeline();
+
+                                // Record pipeline processing time even for dropped items
+                                let elapsed = start_time.elapsed();
+                                {
+                                    let mut stats_map = pipeline_stats_clone.write().await;
+                                    let pipeline_name = pipeline.name().to_string();
+                                    let (total_time, count) = stats_map
+                                        .entry(pipeline_name)
+                                        .or_insert((Duration::new(0, 0), 0));
+                                    *total_time += elapsed;
+                                    *count += 1;
+                                }
+
                                 break;
                             }
                             Err(e) => {
                                 error!("Pipeline '{}' error: {:?}", pipeline.name(), e);
                                 stats_clone.increment_items_dropped_by_pipeline();
+
+                                let elapsed = start_time.elapsed();
+                                {
+                                    let mut stats_map = pipeline_stats_clone.write().await;
+                                    let pipeline_name = pipeline.name().to_string();
+                                    let (total_time, count) = stats_map
+                                        .entry(pipeline_name)
+                                        .or_insert((Duration::new(0, 0), 0));
+                                    *total_time += elapsed;
+                                    *count += 1;
+                                }
+
                                 break;
                             }
                         }
@@ -94,6 +143,7 @@ where
                 drop(permit);
             });
         }
+
         trace!("Waiting for active item processing tasks to complete");
         while let Some(res) = tasks.join_next().await {
             if let Err(e) = res {

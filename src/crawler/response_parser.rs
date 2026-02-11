@@ -53,18 +53,21 @@ use crate::spider::Spider;
 use crate::state::CrawlerState;
 use crate::stats::StatCollector;
 use kanal::{AsyncReceiver, AsyncSender};
+use log::{debug, error, info, trace, warn};
 use spider_util::item::{ParseOutput, ScrapedItem};
 use spider_util::response::Response;
 use std::cmp::max;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tracing::{debug, error, info, trace, warn};
+use tokio::sync::RwLock;
+use tokio::time::Instant;
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_parser_task<S>(
     scheduler: Arc<Scheduler>,
-    spider: Arc<Mutex<S>>,
+    spider: Arc<S>,
+    spider_state: Arc<S::State>,
     state: Arc<CrawlerState>,
     res_rx: AsyncReceiver<Response>,
     item_tx: AsyncSender<S::Item>,
@@ -75,25 +78,41 @@ where
     S: Spider + 'static,
     S::Item: ScrapedItem,
 {
-    let mut tasks = tokio::task::JoinSet::new();
     let (internal_parse_tx, internal_parse_rx) =
         kanal::bounded_async::<Response>(parser_workers * 2);
 
-    // Spawn N parsing worker tasks
+    // Track worker count dynamically
+    let current_worker_count = Arc::new(RwLock::new(parser_workers));
+
+    // Create a shared JoinSet for all parser tasks
+    let shared_tasks = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::<
+        tokio::task::JoinHandle<()>,
+    >::new()));
+
+    // Spawn initial parsing worker tasks
     for _ in 0..parser_workers {
         let internal_parse_rx_clone = internal_parse_rx.clone();
         let spider_clone = Arc::clone(&spider);
+        let spider_state_clone = Arc::clone(&spider_state);
         let scheduler_clone = Arc::clone(&scheduler);
         let item_tx_clone = item_tx.clone();
         let state_clone = Arc::clone(&state);
         let stats_clone = Arc::clone(&stats);
+        let _tasks_clone = Arc::clone(&shared_tasks);
 
-        tasks.spawn(async move {
+        tokio::spawn(async move {
             while let Ok(response) = internal_parse_rx_clone.recv().await {
                 debug!("Parsing response from {}", response.url);
+                state_clone.parsing_responses.fetch_add(1, Ordering::SeqCst);
 
                 {
-                    let parse_output = spider_clone.lock().await.parse(response).await;
+                    let start_time = Instant::now();
+                    let parse_output = spider_clone.parse(response, &spider_state_clone).await;
+                    let elapsed = start_time.elapsed();
+
+                    // Record parsing time for performance metrics
+                    stats_clone.record_parsing_time(elapsed);
+
                     match parse_output {
                         Ok(outputs) => {
                             process_crawl_outputs::<S>(
@@ -113,9 +132,101 @@ where
         });
     }
 
+    // Dynamic worker scaling task
+    let scaling_scheduler = Arc::clone(&scheduler);
+    let scaling_spider = Arc::clone(&spider);
+    let scaling_spider_state = Arc::clone(&spider_state);
+    let scaling_state = Arc::clone(&state);
+    let scaling_item_tx = item_tx.clone();
+    let scaling_stats = Arc::clone(&stats);
+    let scaling_worker_count = Arc::clone(&current_worker_count);
+    let scaling_internal_parse_rx = internal_parse_rx.clone();
+    let scaling_shared_tasks = Arc::clone(&shared_tasks);
+
+    tokio::spawn(async move {
+        let mut last_scale_check = Instant::now();
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Scale workers based on queue depth and processing times
+            if last_scale_check.elapsed() >= Duration::from_secs(1) {
+                let current_workers = *scaling_worker_count.read().await;
+                let queue_depth = scaling_internal_parse_rx.len();
+
+                // Scale up if queue is backing up significantly
+                if queue_depth > current_workers * 3 && current_workers < parser_workers * 4 {
+                    let mut worker_count = scaling_worker_count.write().await;
+                    if *worker_count < parser_workers * 4 {
+                        *worker_count += 1;
+
+                        // Spawn a new worker
+                        let internal_parse_rx_clone = scaling_internal_parse_rx.clone();
+                        let spider_clone = Arc::clone(&scaling_spider);
+                        let spider_state_clone = Arc::clone(&scaling_spider_state);
+                        let scheduler_clone = Arc::clone(&scaling_scheduler);
+                        let item_tx_clone = scaling_item_tx.clone();
+                        let state_clone = Arc::clone(&scaling_state);
+                        let stats_clone = Arc::clone(&scaling_stats);
+                        let _tasks_clone = Arc::clone(&scaling_shared_tasks);
+
+                        tokio::spawn(async move {
+                            while let Ok(response) = internal_parse_rx_clone.recv().await {
+                                debug!("Parsing response from {}", response.url);
+                                state_clone.parsing_responses.fetch_add(1, Ordering::SeqCst);
+
+                                {
+                                    let start_time = Instant::now();
+                                    let parse_output =
+                                        spider_clone.parse(response, &spider_state_clone).await;
+                                    let elapsed = start_time.elapsed();
+
+                                    // Record parsing time for performance metrics
+                                    stats_clone.record_parsing_time(elapsed);
+
+                                    match parse_output {
+                                        Ok(outputs) => {
+                                            process_crawl_outputs::<S>(
+                                                outputs,
+                                                scheduler_clone.clone(),
+                                                item_tx_clone.clone(),
+                                                state_clone.clone(),
+                                                stats_clone.clone(),
+                                            )
+                                            .await;
+                                        }
+                                        Err(e) => error!("Spider parsing error: {:?}", e),
+                                    }
+                                }
+                                state_clone.parsing_responses.fetch_sub(1, Ordering::SeqCst);
+                            }
+                        });
+
+                        trace!("Scaled up parser workers to: {}", *worker_count);
+                    }
+                }
+                // Scale down if queue is consistently low
+                else if queue_depth < current_workers / 2 && current_workers > parser_workers {
+                    let mut worker_count = scaling_worker_count.write().await;
+                    if *worker_count > parser_workers {
+                        *worker_count -= 1;
+                        trace!("Scaled down parser workers to: {}", *worker_count);
+                    }
+                }
+
+                last_scale_check = Instant::now();
+            }
+
+            // Check if scheduler is shutting down
+            if scaling_scheduler.is_shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+    });
+
     tokio::spawn(async move {
         trace!(
-            "Response parser coordinator started with {} workers",
+            "Response parser coordinator started with {} workers (dynamic scaling enabled)",
             parser_workers
         );
         while let Ok(response) = res_rx.recv().await {
@@ -133,14 +244,15 @@ where
             state.parsing_responses.fetch_add(1, Ordering::SeqCst);
             if internal_parse_tx.send(response).await.is_err() {
                 error!("Internal parse channel closed, cannot send response to parser worker.");
-                state.parsing_responses.fetch_sub(1, Ordering::SeqCst);
             }
+            state.parsing_responses.fetch_sub(1, Ordering::SeqCst);
         }
 
         trace!("Closing internal parse channel");
         drop(internal_parse_tx);
 
         trace!("Waiting for parsing worker tasks to complete");
+        let mut tasks = shared_tasks.lock().await;
         while let Some(res) = tasks.join_next().await {
             if let Err(e) = res {
                 error!("A parsing worker task failed: {:?}", e);

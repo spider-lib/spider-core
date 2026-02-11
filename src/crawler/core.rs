@@ -23,16 +23,15 @@ use spider_pipeline::pipeline::Pipeline;
 use spider_util::error::SpiderError;
 use spider_util::item::ScrapedItem;
 use spider_util::request::Request;
-use tracing::{debug, error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 
 #[cfg(feature = "checkpoint")]
 use crate::checkpoint::save_checkpoint;
 #[cfg(feature = "checkpoint")]
 use std::path::PathBuf;
 
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 #[cfg(feature = "cookie-store")]
 use tokio::sync::RwLock;
@@ -47,7 +46,8 @@ pub struct Crawler<S: Spider, C> {
     stats: Arc<StatCollector>,
     downloader: Arc<dyn Downloader<Client = C> + Send + Sync>,
     middlewares: Vec<Box<dyn Middleware<C> + Send + Sync>>,
-    spider: Arc<Mutex<S>>,
+    spider: Arc<S>,
+    spider_state: Arc<S::State>,
     item_pipelines: Vec<Box<dyn Pipeline<S::Item>>>,
     max_concurrent_downloads: usize,
     parser_workers: usize,
@@ -91,7 +91,8 @@ where
             stats,
             downloader,
             middlewares,
-            spider: Arc::new(Mutex::new(spider)),
+            spider: Arc::new(spider),
+            spider_state: Arc::new(S::State::default()),
             item_pipelines,
             max_concurrent_downloads,
             parser_workers,
@@ -122,6 +123,7 @@ where
             downloader,
             middlewares,
             spider,
+            spider_state,
             item_pipelines,
             max_concurrent_downloads,
             parser_workers,
@@ -141,6 +143,7 @@ where
             downloader,
             middlewares,
             spider,
+            spider_state,
             item_pipelines,
             max_concurrent_downloads,
             parser_workers,
@@ -189,6 +192,7 @@ where
         let parser_task = super::spawn_parser_task::<S>(
             scheduler.clone(),
             spider.clone(),
+            spider_state.clone(),
             state.clone(),
             res_rx,
             item_tx.clone(),
@@ -358,10 +362,7 @@ where
         debug!("All item pipelines closed");
 
         info!(
-            "Crawl finished successfully. Stats: requests_enqueued={}, requests_succeeded={}, items_scraped={}",
-            stats.requests_enqueued.load(Ordering::SeqCst),
-            stats.requests_succeeded.load(Ordering::SeqCst),
-            stats.items_scraped.load(Ordering::SeqCst)
+            "Crawl finished successfully\n{}", stats
         );
         Ok(())
     }
@@ -376,7 +377,7 @@ where
 
 fn spawn_initial_requests_task<S>(
     scheduler: Arc<Scheduler>,
-    spider: Arc<Mutex<S>>,
+    spider: Arc<S>,
     stats: Arc<StatCollector>,
 ) -> tokio::task::JoinHandle<()>
 where
@@ -384,7 +385,7 @@ where
     S::Item: ScrapedItem,
 {
     tokio::spawn(async move {
-        match spider.lock().await.start_requests() {
+        match spider.start_requests() {
             Ok(requests) => {
                 for mut req in requests {
                     req.url.set_fragment(None);

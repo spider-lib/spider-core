@@ -36,6 +36,7 @@
 pub mod builder;
 #[cfg(feature = "checkpoint")]
 pub mod checkpoint;
+pub mod concurrency;
 pub mod crawler;
 pub mod prelude;
 pub mod scheduler;
@@ -54,6 +55,7 @@ pub use spider_downloader::{Downloader, ReqwestClientDownloader, SimpleHttpClien
 pub use cookie_store::CookieStore;
 
 pub use builder::CrawlerBuilder;
+pub use concurrency::{AdaptiveSemaphore, ResourceQuotaManager};
 pub use crawler::Crawler;
 pub use scheduler::Scheduler;
 pub use spider_macro::scraped_item;

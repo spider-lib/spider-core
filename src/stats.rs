@@ -55,6 +55,7 @@ pub(crate) struct ExpMovingAverage {
     alpha: f64,  // Smoothing factor (typically 0.1-0.3)
     rate: Arc<parking_lot::RwLock<f64>>,
     last_update: Arc<parking_lot::RwLock<Instant>>,
+    event_count: Arc<parking_lot::RwLock<usize>>,
 }
 
 impl ExpMovingAverage {
@@ -63,20 +64,28 @@ impl ExpMovingAverage {
             alpha,
             rate: Arc::new(parking_lot::RwLock::new(0.0)),
             last_update: Arc::new(parking_lot::RwLock::new(Instant::now())),
+            event_count: Arc::new(parking_lot::RwLock::new(0)),
         }
     }
 
     fn update(&self, count: usize) {
         let now = Instant::now();
         let mut last_update = self.last_update.write();
-        let time_delta = now.duration_since(*last_update).as_secs_f64();
-        *last_update = now;
+        let mut event_count = self.event_count.write();
         
-        if time_delta > 0.0 {
-            let current_rate = count as f64 / time_delta;
+        *event_count += count;
+        let time_delta = now.duration_since(*last_update).as_secs_f64();
+        
+        // Update rate every second or so to prevent excessive computation
+        if time_delta >= 1.0 {
+            let current_rate = *event_count as f64 / time_delta;
             let mut rate = self.rate.write();
             // Apply exponential moving average formula
             *rate = self.alpha * current_rate + (1.0 - self.alpha) * (*rate);
+            
+            // Reset for next interval
+            *event_count = 0;
+            *last_update = now;
         }
     }
 
@@ -106,7 +115,11 @@ struct StatsSnapshot {
     fastest_request_time: Option<Duration>,
     slowest_request_time: Option<Duration>,
     request_time_count: usize,
-    
+    average_parsing_time: Option<Duration>,
+    fastest_parsing_time: Option<Duration>,
+    slowest_parsing_time: Option<Duration>,
+    parsing_time_count: usize,
+
     // Recent rates from sliding windows
     recent_requests_per_second: f64,
     recent_responses_per_second: f64,
@@ -132,15 +145,30 @@ impl StatsSnapshot {
     }
 
     fn requests_per_second(&self) -> f64 {
-        self.recent_requests_per_second
+        let elapsed = self.elapsed_duration.as_secs_f64();
+        if elapsed > 0.0 {
+            self.requests_sent as f64 / elapsed
+        } else {
+            0.0
+        }
     }
 
     fn responses_per_second(&self) -> f64 {
-        self.recent_responses_per_second
+        let elapsed = self.elapsed_duration.as_secs_f64();
+        if elapsed > 0.0 {
+            self.responses_received as f64 / elapsed
+        } else {
+            0.0
+        }
     }
 
     fn items_per_second(&self) -> f64 {
-        self.recent_items_per_second
+        let elapsed = self.elapsed_duration.as_secs_f64();
+        if elapsed > 0.0 {
+            self.items_scraped as f64 / elapsed
+        } else {
+            0.0
+        }
     }
 
     fn formatted_bytes(&self) -> String {
@@ -190,7 +218,8 @@ pub struct StatCollector {
 
     // Timing metrics
     pub request_times: Arc<dashmap::DashMap<String, Duration>>,
-    
+    pub parsing_times: Arc<dashmap::DashMap<String, Duration>>,
+
     // Exponential moving average metrics for accurate speed calculations
     #[serde(skip)]
     requests_sent_ema: ExpMovingAverage,
@@ -198,14 +227,6 @@ pub struct StatCollector {
     responses_received_ema: ExpMovingAverage,
     #[serde(skip)]
     items_scraped_ema: ExpMovingAverage,
-    
-    // Track previous counts for rate calculation
-    #[serde(skip)]
-    prev_requests_sent: AtomicUsize,
-    #[serde(skip)]
-    prev_responses_received: AtomicUsize,
-    #[serde(skip)]
-    prev_items_scraped: AtomicUsize,
 }
 
 impl StatCollector {
@@ -227,15 +248,11 @@ impl StatCollector {
             items_processed: AtomicUsize::new(0),
             items_dropped_by_pipeline: AtomicUsize::new(0),
             request_times: Arc::new(dashmap::DashMap::new()),
+            parsing_times: Arc::new(dashmap::DashMap::new()),
             // Initialize exponential moving averages for recent speed calculations (alpha = 0.2 for good balance)
             requests_sent_ema: ExpMovingAverage::new(0.2),
             responses_received_ema: ExpMovingAverage::new(0.2),
             items_scraped_ema: ExpMovingAverage::new(0.2),
-            
-            // Initialize previous counts to 0
-            prev_requests_sent: AtomicUsize::new(0),
-            prev_responses_received: AtomicUsize::new(0),
-            prev_items_scraped: AtomicUsize::new(0),
         }
     }
 
@@ -272,7 +289,11 @@ impl StatCollector {
             fastest_request_time: self.fastest_request_time(),
             slowest_request_time: self.slowest_request_time(),
             request_time_count: self.request_time_count(),
-            
+            average_parsing_time: self.average_parsing_time(),
+            fastest_parsing_time: self.fastest_parsing_time(),
+            slowest_parsing_time: self.slowest_parsing_time(),
+            parsing_time_count: self.parsing_time_count(),
+
             // Recent rates from sliding windows
             recent_requests_per_second,
             recent_responses_per_second,
@@ -287,13 +308,9 @@ impl StatCollector {
 
     /// Increments the count of sent requests.
     pub(crate) fn increment_requests_sent(&self) {
-        let new_count = self.requests_sent.fetch_add(1, Ordering::SeqCst) + 1;
-        // Calculate how many requests were sent since the last update
-        let prev_count = self.prev_requests_sent.load(Ordering::SeqCst);
-        let delta = new_count - prev_count;
-        self.requests_sent_ema.update(delta);
-        // Update the previous count
-        self.prev_requests_sent.store(new_count, Ordering::SeqCst);
+        self.requests_sent.fetch_add(1, Ordering::SeqCst);
+        // Update the EMA with a count of 1 for this event
+        self.requests_sent_ema.update(1);
     }
 
     /// Increments the count of successful requests.
@@ -318,13 +335,9 @@ impl StatCollector {
 
     /// Increments the count of received responses.
     pub(crate) fn increment_responses_received(&self) {
-        let new_count = self.responses_received.fetch_add(1, Ordering::SeqCst) + 1;
-        // Calculate how many responses were received since the last update
-        let prev_count = self.prev_responses_received.load(Ordering::SeqCst);
-        let delta = new_count - prev_count;
-        self.responses_received_ema.update(delta);
-        // Update the previous count
-        self.prev_responses_received.store(new_count, Ordering::SeqCst);
+        self.responses_received.fetch_add(1, Ordering::SeqCst);
+        // Update the EMA with a count of 1 for this event
+        self.responses_received_ema.update(1);
     }
 
     /// Increments the count of responses served from cache.
@@ -345,13 +358,9 @@ impl StatCollector {
 
     /// Increments the count of scraped items.
     pub(crate) fn increment_items_scraped(&self) {
-        let new_count = self.items_scraped.fetch_add(1, Ordering::SeqCst) + 1;
-        // Calculate how many items were scraped since the last update
-        let prev_count = self.prev_items_scraped.load(Ordering::SeqCst);
-        let delta = new_count - prev_count;
-        self.items_scraped_ema.update(delta);
-        // Update the previous count
-        self.prev_items_scraped.store(new_count, Ordering::SeqCst);
+        self.items_scraped.fetch_add(1, Ordering::SeqCst);
+        // Update the EMA with a count of 1 for this event
+        self.items_scraped_ema.update(1);
     }
 
     /// Increments the count of processed items.
@@ -414,6 +423,43 @@ impl StatCollector {
             .iter()
             .map(|entry| (entry.key().clone(), *entry.value()))
             .collect()
+    }
+
+    /// Records the time taken for parsing a response.
+    pub fn record_parsing_time(&self, duration: Duration) {
+        let id = format!("parse_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        self.parsing_times.insert(id, duration);
+    }
+
+    /// Calculates the average parsing time across all recorded parses.
+    pub fn average_parsing_time(&self) -> Option<Duration> {
+        let times: Vec<Duration> = self
+            .parsing_times
+            .iter()
+            .map(|entry| *entry.value())
+            .collect();
+        if times.is_empty() {
+            None
+        } else {
+            let total_nanos: u128 = times.iter().map(|d| d.as_nanos()).sum();
+            let avg_nanos = total_nanos / times.len() as u128;
+            Some(Duration::from_nanos(avg_nanos as u64))
+        }
+    }
+
+    /// Gets the fastest parsing time among all recorded parses.
+    pub fn fastest_parsing_time(&self) -> Option<Duration> {
+        self.parsing_times.iter().map(|entry| *entry.value()).min()
+    }
+
+    /// Gets the slowest parsing time among all recorded parses.
+    pub fn slowest_parsing_time(&self) -> Option<Duration> {
+        self.parsing_times.iter().map(|entry| *entry.value()).max()
+    }
+
+    /// Gets the total number of recorded parsing times.
+    pub fn parsing_time_count(&self) -> usize {
+        self.parsing_times.len()
     }
 
     /// Clears all recorded request times.
@@ -486,6 +532,14 @@ impl StatCollector {
 | Slowest Request  | {}         |
 | Total Recorded   | {}         |
 
+## Parsing Times
+| Metric           | Value      |
+|------------------|------------|
+| Average Time     | {}         |
+| Fastest Parse    | {}         |
+| Slowest Parse    | {}         |
+| Total Recorded   | {}         |
+
 ## Status Codes
 {}
 "#,
@@ -522,6 +576,10 @@ impl StatCollector {
             snapshot.formatted_request_time(snapshot.fastest_request_time),
             snapshot.formatted_request_time(snapshot.slowest_request_time),
             snapshot.request_time_count,
+            snapshot.formatted_request_time(snapshot.average_parsing_time),
+            snapshot.formatted_request_time(snapshot.fastest_parsing_time),
+            snapshot.formatted_request_time(snapshot.slowest_parsing_time),
+            snapshot.parsing_time_count,
             status_codes_output
         )
     }
@@ -543,9 +601,9 @@ impl std::fmt::Display for StatCollector {
         writeln!(
             f,
             "  speed    : req/s: {:.2}, resp/s: {:.2}, item/s: {:.2}",
-            snapshot.requests_per_second(),
-            snapshot.responses_per_second(),
-            snapshot.items_per_second()
+            snapshot.recent_requests_per_second,
+            snapshot.recent_responses_per_second,
+            snapshot.recent_items_per_second
         )?;
         writeln!(
             f,
@@ -571,11 +629,19 @@ impl std::fmt::Display for StatCollector {
         )?;
         writeln!(
             f,
-            "  times    : avg: {}, fastest: {}, slowest: {}, total: {}",
+            "  req time : avg: {}, fastest: {}, slowest: {}, total: {}",
             snapshot.formatted_request_time(snapshot.average_request_time),
             snapshot.formatted_request_time(snapshot.fastest_request_time),
             snapshot.formatted_request_time(snapshot.slowest_request_time),
             snapshot.request_time_count
+        )?;
+        writeln!(
+            f,
+            "  parsing  : avg: {}, fastest: {}, slowest: {}, total: {}",
+            snapshot.formatted_request_time(snapshot.average_parsing_time),
+            snapshot.formatted_request_time(snapshot.fastest_parsing_time),
+            snapshot.formatted_request_time(snapshot.slowest_parsing_time),
+            snapshot.parsing_time_count
         )?;
 
         let status_string = if snapshot.response_status_counts.is_empty() {
